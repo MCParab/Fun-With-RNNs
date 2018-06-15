@@ -1,0 +1,3998 @@
+"""Python part of the warnings subsystem."""
+
+import sys
+
+__all__ = ["warn", "warn_explicit", "showwarning",
+           "formatwarning", "filterwarnings", "simplefilter",
+           "resetwarnings", "catch_warnings"]
+
+
+def showwarning(message, category, filename, lineno, file=None, line=None):
+    """Hook to write a warning to a file; replace if you like."""
+    if file is None:
+        file = sys.stderr
+        if file is None:
+            # sys.stderr is None when run with pythonw.exe - warnings get lost
+            return
+    try:
+        file.write(formatwarning(message, category, filename, lineno, line))
+    except OSError:
+        pass # the file (probably stderr) is invalid - this warning gets lost.
+
+def formatwarning(message, category, filename, lineno, line=None):
+    """Function to format a warning the standard way."""
+    s =  "%s:%s: %s: %s\n" % (filename, lineno, category.__name__, message)
+    if line is None:
+        try:
+            import linecache
+            line = linecache.getline(filename, lineno)
+        except Exception:
+            # When a warning is logged during Python shutdown, linecache
+            # and the import machinery don't work anymore
+            line = None
+    if line:
+        line = line.strip()
+        s += "  %s\n" % line
+    return s
+
+def filterwarnings(action, message="", category=Warning, module="", lineno=0,
+                   append=False):
+    """Insert an entry into the list of warnings filters (at the front).
+
+    'action' -- one of "error", "ignore", "always", "default", "module",
+                or "once"
+    'message' -- a regex that the warning message must match
+    'category' -- a class that the warning must be a subclass of
+    'module' -- a regex that the module name must match
+    'lineno' -- an integer line number, 0 matches all warnings
+    'append' -- if true, append to the list of filters
+    """
+    import re
+    assert action in ("error", "ignore", "always", "default", "module",
+                      "once"), "invalid action: %r" % (action,)
+    assert isinstance(message, str), "message must be a string"
+    assert isinstance(category, type), "category must be a class"
+    assert issubclass(category, Warning), "category must be a Warning subclass"
+    assert isinstance(module, str), "module must be a string"
+    assert isinstance(lineno, int) and lineno >= 0, \
+           "lineno must be an int >= 0"
+    _add_filter(action, re.compile(message, re.I), category,
+            re.compile(module), lineno, append=append)
+
+def simplefilter(action, category=Warning, lineno=0, append=False):
+    """Insert a simple entry into the list of warnings filters (at the front).
+
+    A simple filter matches all modules and messages.
+    'action' -- one of "error", "ignore", "always", "default", "module",
+                or "once"
+    'category' -- a class that the warning must be a subclass of
+    'lineno' -- an integer line number, 0 matches all warnings
+    'append' -- if true, append to the list of filters
+    """
+    assert action in ("error", "ignore", "always", "default", "module",
+                      "once"), "invalid action: %r" % (action,)
+    assert isinstance(lineno, int) and lineno >= 0, \
+           "lineno must be an int >= 0"
+    _add_filter(action, None, category, None, lineno, append=append)
+
+def _add_filter(*item, append):
+    # Remove possible duplicate filters, so new one will be placed
+    # in correct place. If append=True and duplicate exists, do nothing.
+    if not append:
+        try:
+            filters.remove(item)
+        except ValueError:
+            pass
+        filters.insert(0, item)
+    else:
+        if item not in filters:
+            filters.append(item)
+    _filters_mutated()
+
+def resetwarnings():
+    """Clear the list of warning filters, so that no filters are active."""
+    filters[:] = []
+    _filters_mutated()
+
+class _OptionError(Exception):
+    """Exception used by option processing helpers."""
+    pass
+
+# Helper to process -W options passed via sys.warnoptions
+def _processoptions(args):
+    for arg in args:
+        try:
+            _setoption(arg)
+        except _OptionError as msg:
+            print("Invalid -W option ignored:", msg, file=sys.stderr)
+
+# Helper for _processoptions()
+def _setoption(arg):
+    import re
+    parts = arg.split(':')
+    if len(parts) > 5:
+        raise _OptionError("too many fields (max 5): %r" % (arg,))
+    while len(parts) < 5:
+        parts.append('')
+    action, message, category, module, lineno = [s.strip()
+                                                 for s in parts]
+    action = _getaction(action)
+    message = re.escape(message)
+    category = _getcategory(category)
+    module = re.escape(module)
+    if module:
+        module = module + '$'
+    if lineno:
+        try:
+            lineno = int(lineno)
+            if lineno < 0:
+                raise ValueError
+        except (ValueError, OverflowError):
+            raise _OptionError("invalid lineno %r" % (lineno,))
+    else:
+        lineno = 0
+    filterwarnings(action, message, category, module, lineno)
+
+# Helper for _setoption()
+def _getaction(action):
+    if not action:
+        return "default"
+    if action == "all": return "always" # Alias
+    for a in ('default', 'always', 'ignore', 'module', 'once', 'error'):
+        if a.startswith(action):
+            return a
+    raise _OptionError("invalid action: %r" % (action,))
+
+# Helper for _setoption()
+def _getcategory(category):
+    import re
+    if not category:
+        return Warning
+    if re.match("^[a-zA-Z0-9_]+$", category):
+        try:
+            cat = eval(category)
+        except NameError:
+            raise _OptionError("unknown warning category: %r" % (category,))
+    else:
+        i = category.rfind(".")
+        module = category[:i]
+        klass = category[i+1:]
+        try:
+            m = __import__(module, None, None, [klass])
+        except ImportError:
+            raise _OptionError("invalid module name: %r" % (module,))
+        try:
+            cat = getattr(m, klass)
+        except AttributeError:
+            raise _OptionError("unknown warning category: %r" % (category,))
+    if not issubclass(cat, Warning):
+        raise _OptionError("invalid warning category: %r" % (category,))
+    return cat
+
+
+def _is_internal_frame(frame):
+    """Signal whether the frame is an internal CPython implementation detail."""
+    filename = frame.f_code.co_filename
+    return 'importlib' in filename and '_bootstrap' in filename
+
+
+def _next_external_frame(frame):
+    """Find the next frame that doesn't involve CPython internals."""
+    frame = frame.f_back
+    while frame is not None and _is_internal_frame(frame):
+        frame = frame.f_back
+    return frame
+
+
+# Code typically replaced by _warnings
+def warn(message, category=None, stacklevel=1):
+    """Issue a warning, or maybe ignore it or raise an exception."""
+    # Check if message is already a Warning object
+    if isinstance(message, Warning):
+        category = message.__class__
+    # Check category argument
+    if category is None:
+        category = UserWarning
+    if not (isinstance(category, type) and issubclass(category, Warning)):
+        raise TypeError("category must be a Warning subclass, "
+                        "not '{:s}'".format(type(category).__name__))
+    # Get context information
+    try:
+        if stacklevel <= 1 or _is_internal_frame(sys._getframe(1)):
+            # If frame is too small to care or if the warning originated in
+            # internal code, then do not try to hide any frames.
+            frame = sys._getframe(stacklevel)
+        else:
+            frame = sys._getframe(1)
+            # Look for one frame less since the above line starts us off.
+            for x in range(stacklevel-1):
+                frame = _next_external_frame(frame)
+                if frame is None:
+                    raise ValueError
+    except ValueError:
+        globals = sys.__dict__
+        lineno = 1
+    else:
+        globals = frame.f_globals
+        lineno = frame.f_lineno
+    if '__name__' in globals:
+        module = globals['__name__']
+    else:
+        module = "<string>"
+    filename = globals.get('__file__')
+    if filename:
+        fnl = filename.lower()
+        if fnl.endswith(".pyc"):
+            filename = filename[:-1]
+    else:
+        if module == "__main__":
+            try:
+                filename = sys.argv[0]
+            except AttributeError:
+                # embedded interpreters don't have sys.argv, see bug #839151
+                filename = '__main__'
+        if not filename:
+            filename = module
+    registry = globals.setdefault("__warningregistry__", {})
+    warn_explicit(message, category, filename, lineno, module, registry,
+                  globals)
+
+def warn_explicit(message, category, filename, lineno,
+                  module=None, registry=None, module_globals=None):
+    lineno = int(lineno)
+    if module is None:
+        module = filename or "<unknown>"
+        if module[-3:].lower() == ".py":
+            module = module[:-3] # XXX What about leading pathname?
+    if registry is None:
+        registry = {}
+    if registry.get('version', 0) != _filters_version:
+        registry.clear()
+        registry['version'] = _filters_version
+    if isinstance(message, Warning):
+        text = str(message)
+        category = message.__class__
+    else:
+        text = message
+        message = category(message)
+    key = (text, category, lineno)
+    # Quick test for common case
+    if registry.get(key):
+        return
+    # Search the filters
+    for item in filters:
+        action, msg, cat, mod, ln = item
+        if ((msg is None or msg.match(text)) and
+            issubclass(category, cat) and
+            (mod is None or mod.match(module)) and
+            (ln == 0 or lineno == ln)):
+            break
+    else:
+        action = defaultaction
+    # Early exit actions
+    if action == "ignore":
+        registry[key] = 1
+        return
+
+    # Prime the linecache for formatting, in case the
+    # "file" is actually in a zipfile or something.
+    import linecache
+    linecache.getlines(filename, module_globals)
+
+    if action == "error":
+        raise message
+    # Other actions
+    if action == "once":
+        registry[key] = 1
+        oncekey = (text, category)
+        if onceregistry.get(oncekey):
+            return
+        onceregistry[oncekey] = 1
+    elif action == "always":
+        pass
+    elif action == "module":
+        registry[key] = 1
+        altkey = (text, category, 0)
+        if registry.get(altkey):
+            return
+        registry[altkey] = 1
+    elif action == "default":
+        registry[key] = 1
+    else:
+        # Unrecognized actions are errors
+        raise RuntimeError(
+              "Unrecognized action (%r) in warnings.filters:\n %s" %
+              (action, item))
+    if not callable(showwarning):
+        raise TypeError("warnings.showwarning() must be set to a "
+                        "function or method")
+    # Print message and context
+    showwarning(message, category, filename, lineno)
+
+
+class WarningMessage(object):
+
+    """Holds the result of a single showwarning() call."""
+
+    _WARNING_DETAILS = ("message", "category", "filename", "lineno", "file",
+                        "line")
+
+    def __init__(self, message, category, filename, lineno, file=None,
+                    line=None):
+        local_values = locals()
+        for attr in self._WARNING_DETAILS:
+            setattr(self, attr, local_values[attr])
+        self._category_name = category.__name__ if category else None
+
+    def __str__(self):
+        return ("{message : %r, category : %r, filename : %r, lineno : %s, "
+                    "line : %r}" % (self.message, self._category_name,
+                                    self.filename, self.lineno, self.line))
+
+
+class catch_warnings(object):
+
+    """A context manager that copies and restores the warnings filter upon
+    exiting the context.
+
+    The 'record' argument specifies whether warnings should be captured by a
+    custom implementation of warnings.showwarning() and be appended to a list
+    returned by the context manager. Otherwise None is returned by the context
+    manager. The objects appended to the list are arguments whose attributes
+    mirror the arguments to showwarning().
+
+    The 'module' argument is to specify an alternative module to the module
+    named 'warnings' and imported under that name. This argument is only useful
+    when testing the warnings module itself.
+
+    """
+
+    def __init__(self, *, record=False, module=None):
+        """Specify whether to record warnings and if an alternative module
+        should be used other than sys.modules['warnings'].
+
+        For compatibility with Python 3.0, please consider all arguments to be
+        keyword-only.
+
+        """
+        self._record = record
+        self._module = sys.modules['warnings'] if module is None else module
+        self._entered = False
+
+    def __repr__(self):
+        args = []
+        if self._record:
+            args.append("record=True")
+        if self._module is not sys.modules['warnings']:
+            args.append("module=%r" % self._module)
+        name = type(self).__name__
+        return "%s(%s)" % (name, ", ".join(args))
+
+    def __enter__(self):
+        if self._entered:
+            raise RuntimeError("Cannot enter %r twice" % self)
+        self._entered = True
+        self._filters = self._module.filters
+        self._module.filters = self._filters[:]
+        self._module._filters_mutated()
+        self._showwarning = self._module.showwarning
+        if self._record:
+            log = []
+            def showwarning(*args, **kwargs):
+                log.append(WarningMessage(*args, **kwargs))
+            self._module.showwarning = showwarning
+            return log
+        else:
+            return None
+
+    def __exit__(self, *exc_info):
+        if not self._entered:
+            raise RuntimeError("Cannot exit %r without entering first" % self)
+        self._module.filters = self._filters
+        self._module._filters_mutated()
+        self._module.showwarning = self._showwarning
+
+
+# filters contains a sequence of filter 5-tuples
+# The components of the 5-tuple are:
+# - an action: error, ignore, always, default, module, or once
+# - a compiled regex that must match the warning message
+# - a class representing the warning category
+# - a compiled regex that must match the module that is being warned
+# - a line number for the line being warning, or 0 to mean any line
+# If either if the compiled regexs are None, match anything.
+_warnings_defaults = False
+try:
+    from _warnings import (filters, _defaultaction, _onceregistry,
+                           warn, warn_explicit, _filters_mutated)
+    defaultaction = _defaultaction
+    onceregistry = _onceregistry
+    _warnings_defaults = True
+except ImportError:
+    filters = []
+    defaultaction = "default"
+    onceregistry = {}
+
+    _filters_version = 1
+
+    def _filters_mutated():
+        global _filters_version
+        _filters_version += 1
+
+
+# Module initialization
+_processoptions(sys.warnoptions)
+if not _warnings_defaults:
+    silence = [ImportWarning, PendingDeprecationWarning]
+    silence.append(DeprecationWarning)
+    for cls in silence:
+        simplefilter("ignore", category=cls)
+    bytes_warning = sys.flags.bytes_warning
+    if bytes_warning > 1:
+        bytes_action = "error"
+    elif bytes_warning:
+        bytes_action = "default"
+    else:
+        bytes_action = "ignore"
+    simplefilter(bytes_action, category=BytesWarning, append=1)
+    # resource usage warnings are enabled by default in pydebug mode
+    if hasattr(sys, 'gettotalrefcount'):
+        resource_action = "always"
+    else:
+        resource_action = "ignore"
+    simplefilter(resource_action, category=ResourceWarning, append=1)
+
+del _warnings_defaults
+
+"""Redo the builtin repr() (representation) but with limits on most sizes."""
+
+__all__ = ["Repr", "repr", "recursive_repr"]
+
+import builtins
+from itertools import islice
+try:
+    from _thread import get_ident
+except ImportError:
+    from _dummy_thread import get_ident
+
+def recursive_repr(fillvalue='...'):
+    'Decorator to make a repr function return fillvalue for a recursive call'
+
+    def decorating_function(user_function):
+        repr_running = set()
+
+        def wrapper(self):
+            key = id(self), get_ident()
+            if key in repr_running:
+                return fillvalue
+            repr_running.add(key)
+            try:
+                result = user_function(self)
+            finally:
+                repr_running.discard(key)
+            return result
+
+        # Can't use functools.wraps() here because of bootstrap issues
+        wrapper.__module__ = getattr(user_function, '__module__')
+        wrapper.__doc__ = getattr(user_function, '__doc__')
+        wrapper.__name__ = getattr(user_function, '__name__')
+        wrapper.__qualname__ = getattr(user_function, '__qualname__')
+        wrapper.__annotations__ = getattr(user_function, '__annotations__', {})
+        return wrapper
+
+    return decorating_function
+
+class Repr:
+
+    def __init__(self):
+        self.maxlevel = 6
+        self.maxtuple = 6
+        self.maxlist = 6
+        self.maxarray = 5
+        self.maxdict = 4
+        self.maxset = 6
+        self.maxfrozenset = 6
+        self.maxdeque = 6
+        self.maxstring = 30
+        self.maxlong = 40
+        self.maxother = 30
+
+    def repr(self, x):
+        return self.repr1(x, self.maxlevel)
+
+    def repr1(self, x, level):
+        typename = type(x).__name__
+        if ' ' in typename:
+            parts = typename.split()
+            typename = '_'.join(parts)
+        if hasattr(self, 'repr_' + typename):
+            return getattr(self, 'repr_' + typename)(x, level)
+        else:
+            return self.repr_instance(x, level)
+
+    def _repr_iterable(self, x, level, left, right, maxiter, trail=''):
+        n = len(x)
+        if level <= 0 and n:
+            s = '...'
+        else:
+            newlevel = level - 1
+            repr1 = self.repr1
+            pieces = [repr1(elem, newlevel) for elem in islice(x, maxiter)]
+            if n > maxiter:  pieces.append('...')
+            s = ', '.join(pieces)
+            if n == 1 and trail:  right = trail + right
+        return '%s%s%s' % (left, s, right)
+
+    def repr_tuple(self, x, level):
+        return self._repr_iterable(x, level, '(', ')', self.maxtuple, ',')
+
+    def repr_list(self, x, level):
+        return self._repr_iterable(x, level, '[', ']', self.maxlist)
+
+    def repr_array(self, x, level):
+        if not x:
+            return "array('%s')" % x.typecode
+        header = "array('%s', [" % x.typecode
+        return self._repr_iterable(x, level, header, '])', self.maxarray)
+
+    def repr_set(self, x, level):
+        if not x:
+            return 'set()'
+        x = _possibly_sorted(x)
+        return self._repr_iterable(x, level, '{', '}', self.maxset)
+
+    def repr_frozenset(self, x, level):
+        if not x:
+            return 'frozenset()'
+        x = _possibly_sorted(x)
+        return self._repr_iterable(x, level, 'frozenset({', '})',
+                                   self.maxfrozenset)
+
+    def repr_deque(self, x, level):
+        return self._repr_iterable(x, level, 'deque([', '])', self.maxdeque)
+
+    def repr_dict(self, x, level):
+        n = len(x)
+        if n == 0: return '{}'
+        if level <= 0: return '{...}'
+        newlevel = level - 1
+        repr1 = self.repr1
+        pieces = []
+        for key in islice(_possibly_sorted(x), self.maxdict):
+            keyrepr = repr1(key, newlevel)
+            valrepr = repr1(x[key], newlevel)
+            pieces.append('%s: %s' % (keyrepr, valrepr))
+        if n > self.maxdict: pieces.append('...')
+        s = ', '.join(pieces)
+        return '{%s}' % (s,)
+
+    def repr_str(self, x, level):
+        s = builtins.repr(x[:self.maxstring])
+        if len(s) > self.maxstring:
+            i = max(0, (self.maxstring-3)//2)
+            j = max(0, self.maxstring-3-i)
+            s = builtins.repr(x[:i] + x[len(x)-j:])
+            s = s[:i] + '...' + s[len(s)-j:]
+        return s
+
+    def repr_int(self, x, level):
+        s = builtins.repr(x) # XXX Hope this isn't too slow...
+        if len(s) > self.maxlong:
+            i = max(0, (self.maxlong-3)//2)
+            j = max(0, self.maxlong-3-i)
+            s = s[:i] + '...' + s[len(s)-j:]
+        return s
+
+    def repr_instance(self, x, level):
+        try:
+            s = builtins.repr(x)
+            # Bugs in x.__repr__() can cause arbitrary
+            # exceptions -- then make up something
+        except Exception:
+            return '<%s instance at %#x>' % (x.__class__.__name__, id(x))
+        if len(s) > self.maxother:
+            i = max(0, (self.maxother-3)//2)
+            j = max(0, self.maxother-3-i)
+            s = s[:i] + '...' + s[len(s)-j:]
+        return s
+
+
+def _possibly_sorted(x):
+    # Since not all sequences of items can be sorted and comparison
+    # functions may raise arbitrary exceptions, return an unsorted
+    # sequence in that case.
+    try:
+        return sorted(x)
+    except Exception:
+        return list(x)
+
+aRepr = Repr()
+repr = aRepr.repr
+
+"""Text wrapping and filling.
+"""
+
+# Copyright (C) 1999-2001 Gregory P. Ward.
+# Copyright (C) 2002, 2003 Python Software Foundation.
+# Written by Greg Ward <gward@python.net>
+
+import re
+
+__all__ = ['TextWrapper', 'wrap', 'fill', 'dedent', 'indent', 'shorten']
+
+# Hardcode the recognized whitespace characters to the US-ASCII
+# whitespace characters.  The main reason for doing this is that
+# some Unicode spaces (like \u00a0) are non-breaking whitespaces.
+_whitespace = '\t\n\x0b\x0c\r '
+
+class TextWrapper:
+    """
+    Object for wrapping/filling text.  The public interface consists of
+    the wrap() and fill() methods; the other methods are just there for
+    subclasses to override in order to tweak the default behaviour.
+    If you want to completely replace the main wrapping algorithm,
+    you'll probably have to override _wrap_chunks().
+
+    Several instance attributes control various aspects of wrapping:
+      width (default: 70)
+        the maximum width of wrapped lines (unless break_long_words
+        is false)
+      initial_indent (default: "")
+        string that will be prepended to the first line of wrapped
+        output.  Counts towards the line's width.
+      subsequent_indent (default: "")
+        string that will be prepended to all lines save the first
+        of wrapped output; also counts towards each line's width.
+      expand_tabs (default: true)
+        Expand tabs in input text to spaces before further processing.
+        Each tab will become 0 .. 'tabsize' spaces, depending on its position
+        in its line.  If false, each tab is treated as a single character.
+      tabsize (default: 8)
+        Expand tabs in input text to 0 .. 'tabsize' spaces, unless
+        'expand_tabs' is false.
+      replace_whitespace (default: true)
+        Replace all whitespace characters in the input text by spaces
+        after tab expansion.  Note that if expand_tabs is false and
+        replace_whitespace is true, every tab will be converted to a
+        single space!
+      fix_sentence_endings (default: false)
+        Ensure that sentence-ending punctuation is always followed
+        by two spaces.  Off by default because the algorithm is
+        (unavoidably) imperfect.
+      break_long_words (default: true)
+        Break words longer than 'width'.  If false, those words will not
+        be broken, and some lines might be longer than 'width'.
+      break_on_hyphens (default: true)
+        Allow breaking hyphenated words. If true, wrapping will occur
+        preferably on whitespaces and right after hyphens part of
+        compound words.
+      drop_whitespace (default: true)
+        Drop leading and trailing whitespace from lines.
+      max_lines (default: None)
+        Truncate wrapped lines.
+      placeholder (default: ' [...]')
+        Append to the last line of truncated text.
+    """
+
+    unicode_whitespace_trans = {}
+    uspace = ord(' ')
+    for x in _whitespace:
+        unicode_whitespace_trans[ord(x)] = uspace
+
+    # This funky little regex is just the trick for splitting
+    # text up into word-wrappable chunks.  E.g.
+    #   "Hello there -- you goof-ball, use the -b option!"
+    # splits into
+    #   Hello/ /there/ /--/ /you/ /goof-/ball,/ /use/ /the/ /-b/ /option!
+    # (after stripping out empty strings).
+    word_punct = r'[\w!"\'&.,?]'
+    letter = r'[^\d\W]'
+    whitespace = r'[%s]' % re.escape(_whitespace)
+    nowhitespace = '[^' + whitespace[1:]
+    wordsep_re = re.compile(r'''
+        ( # any whitespace
+          %(ws)s+
+        | # em-dash between words
+          (?<=%(wp)s) -{2,} (?=\w)
+        | # word, possibly hyphenated
+          %(nws)s+? (?:
+            # hyphenated word
+              -(?: (?<=%(lt)s{2}-) | (?<=%(lt)s-%(lt)s-))
+              (?= %(lt)s -? %(lt)s)
+            | # end of word
+              (?=%(ws)s|\Z)
+            | # em-dash
+              (?<=%(wp)s) (?=-{2,}\w)
+            )
+        )''' % {'wp': word_punct, 'lt': letter,
+                'ws': whitespace, 'nws': nowhitespace},
+        re.VERBOSE)
+    del word_punct, letter, nowhitespace
+
+    # This less funky little regex just split on recognized spaces. E.g.
+    #   "Hello there -- you goof-ball, use the -b option!"
+    # splits into
+    #   Hello/ /there/ /--/ /you/ /goof-ball,/ /use/ /the/ /-b/ /option!/
+    wordsep_simple_re = re.compile(r'(%s+)' % whitespace)
+    del whitespace
+
+    # XXX this is not locale- or charset-aware -- string.lowercase
+    # is US-ASCII only (and therefore English-only)
+    sentence_end_re = re.compile(r'[a-z]'             # lowercase letter
+                                 r'[\.\!\?]'          # sentence-ending punct.
+                                 r'[\"\']?'           # optional end-of-quote
+                                 r'\Z')               # end of chunk
+
+    def __init__(self,
+                 width=70,
+                 initial_indent="",
+                 subsequent_indent="",
+                 expand_tabs=True,
+                 replace_whitespace=True,
+                 fix_sentence_endings=False,
+                 break_long_words=True,
+                 drop_whitespace=True,
+                 break_on_hyphens=True,
+                 tabsize=8,
+                 *,
+                 max_lines=None,
+                 placeholder=' [...]'):
+        self.width = width
+        self.initial_indent = initial_indent
+        self.subsequent_indent = subsequent_indent
+        self.expand_tabs = expand_tabs
+        self.replace_whitespace = replace_whitespace
+        self.fix_sentence_endings = fix_sentence_endings
+        self.break_long_words = break_long_words
+        self.drop_whitespace = drop_whitespace
+        self.break_on_hyphens = break_on_hyphens
+        self.tabsize = tabsize
+        self.max_lines = max_lines
+        self.placeholder = placeholder
+
+
+    # -- Private methods -----------------------------------------------
+    # (possibly useful for subclasses to override)
+
+    def _munge_whitespace(self, text):
+        """_munge_whitespace(text : string) -> string
+
+        Munge whitespace in text: expand tabs and convert all other
+        whitespace characters to spaces.  Eg. " foo\\tbar\\n\\nbaz"
+        becomes " foo    bar  baz".
+        """
+        if self.expand_tabs:
+            text = text.expandtabs(self.tabsize)
+        if self.replace_whitespace:
+            text = text.translate(self.unicode_whitespace_trans)
+        return text
+
+
+    def _split(self, text):
+        """_split(text : string) -> [string]
+
+        Split the text to wrap into indivisible chunks.  Chunks are
+        not quite the same as words; see _wrap_chunks() for full
+        details.  As an example, the text
+          Look, goof-ball -- use the -b option!
+        breaks into the following chunks:
+          'Look,', ' ', 'goof-', 'ball', ' ', '--', ' ',
+          'use', ' ', 'the', ' ', '-b', ' ', 'option!'
+        if break_on_hyphens is True, or in:
+          'Look,', ' ', 'goof-ball', ' ', '--', ' ',
+          'use', ' ', 'the', ' ', '-b', ' ', option!'
+        otherwise.
+        """
+        if self.break_on_hyphens is True:
+            chunks = self.wordsep_re.split(text)
+        else:
+            chunks = self.wordsep_simple_re.split(text)
+        chunks = [c for c in chunks if c]
+        return chunks
+
+    def _fix_sentence_endings(self, chunks):
+        """_fix_sentence_endings(chunks : [string])
+
+        Correct for sentence endings buried in 'chunks'.  Eg. when the
+        original text contains "... foo.\\nBar ...", munge_whitespace()
+        and split() will convert that to [..., "foo.", " ", "Bar", ...]
+        which has one too few spaces; this method simply changes the one
+        space to two.
+        """
+        i = 0
+        patsearch = self.sentence_end_re.search
+        while i < len(chunks)-1:
+            if chunks[i+1] == " " and patsearch(chunks[i]):
+                chunks[i+1] = "  "
+                i += 2
+            else:
+                i += 1
+
+    def _handle_long_word(self, reversed_chunks, cur_line, cur_len, width):
+        """_handle_long_word(chunks : [string],
+                             cur_line : [string],
+                             cur_len : int, width : int)
+
+        Handle a chunk of text (most likely a word, not whitespace) that
+        is too long to fit in any line.
+        """
+        # Figure out when indent is larger than the specified width, and make
+        # sure at least one character is stripped off on every pass
+        if width < 1:
+            space_left = 1
+        else:
+            space_left = width - cur_len
+
+        # If we're allowed to break long words, then do so: put as much
+        # of the next chunk onto the current line as will fit.
+        if self.break_long_words:
+            cur_line.append(reversed_chunks[-1][:space_left])
+            reversed_chunks[-1] = reversed_chunks[-1][space_left:]
+
+        # Otherwise, we have to preserve the long word intact.  Only add
+        # it to the current line if there's nothing already there --
+        # that minimizes how much we violate the width constraint.
+        elif not cur_line:
+            cur_line.append(reversed_chunks.pop())
+
+        # If we're not allowed to break long words, and there's already
+        # text on the current line, do nothing.  Next time through the
+        # main loop of _wrap_chunks(), we'll wind up here again, but
+        # cur_len will be zero, so the next line will be entirely
+        # devoted to the long word that we can't handle right now.
+
+    def _wrap_chunks(self, chunks):
+        """_wrap_chunks(chunks : [string]) -> [string]
+
+        Wrap a sequence of text chunks and return a list of lines of
+        length 'self.width' or less.  (If 'break_long_words' is false,
+        some lines may be longer than this.)  Chunks correspond roughly
+        to words and the whitespace between them: each chunk is
+        indivisible (modulo 'break_long_words'), but a line break can
+        come between any two chunks.  Chunks should not have internal
+        whitespace; ie. a chunk is either all whitespace or a "word".
+        Whitespace chunks will be removed from the beginning and end of
+        lines, but apart from that whitespace is preserved.
+        """
+        lines = []
+        if self.width <= 0:
+            raise ValueError("invalid width %r (must be > 0)" % self.width)
+        if self.max_lines is not None:
+            if self.max_lines > 1:
+                indent = self.subsequent_indent
+            else:
+                indent = self.initial_indent
+            if len(indent) + len(self.placeholder.lstrip()) > self.width:
+                raise ValueError("placeholder too large for max width")
+
+        # Arrange in reverse order so items can be efficiently popped
+        # from a stack of chucks.
+        chunks.reverse()
+
+        while chunks:
+
+            # Start the list of chunks that will make up the current line.
+            # cur_len is just the length of all the chunks in cur_line.
+            cur_line = []
+            cur_len = 0
+
+            # Figure out which static string will prefix this line.
+            if lines:
+                indent = self.subsequent_indent
+            else:
+                indent = self.initial_indent
+
+            # Maximum width for this line.
+            width = self.width - len(indent)
+
+            # First chunk on line is whitespace -- drop it, unless this
+            # is the very beginning of the text (ie. no lines started yet).
+            if self.drop_whitespace and chunks[-1].strip() == '' and lines:
+                del chunks[-1]
+
+            while chunks:
+                l = len(chunks[-1])
+
+                # Can at least squeeze this chunk onto the current line.
+                if cur_len + l <= width:
+                    cur_line.append(chunks.pop())
+                    cur_len += l
+
+                # Nope, this line is full.
+                else:
+                    break
+
+            # The current line is full, and the next chunk is too big to
+            # fit on *any* line (not just this one).
+            if chunks and len(chunks[-1]) > width:
+                self._handle_long_word(chunks, cur_line, cur_len, width)
+                cur_len = sum(map(len, cur_line))
+
+            # If the last chunk on this line is all whitespace, drop it.
+            if self.drop_whitespace and cur_line and cur_line[-1].strip() == '':
+                cur_len -= len(cur_line[-1])
+                del cur_line[-1]
+
+            if cur_line:
+                if (self.max_lines is None or
+                    len(lines) + 1 < self.max_lines or
+                    (not chunks or
+                     self.drop_whitespace and
+                     len(chunks) == 1 and
+                     not chunks[0].strip()) and cur_len <= width):
+                    # Convert current line back to a string and store it in
+                    # list of all lines (return value).
+                    lines.append(indent + ''.join(cur_line))
+                else:
+                    while cur_line:
+                        if (cur_line[-1].strip() and
+                            cur_len + len(self.placeholder) <= width):
+                            cur_line.append(self.placeholder)
+                            lines.append(indent + ''.join(cur_line))
+                            break
+                        cur_len -= len(cur_line[-1])
+                        del cur_line[-1]
+                    else:
+                        if lines:
+                            prev_line = lines[-1].rstrip()
+                            if (len(prev_line) + len(self.placeholder) <=
+                                    self.width):
+                                lines[-1] = prev_line + self.placeholder
+                                break
+                        lines.append(indent + self.placeholder.lstrip())
+                    break
+
+        return lines
+
+    def _split_chunks(self, text):
+        text = self._munge_whitespace(text)
+        return self._split(text)
+
+    # -- Public interface ----------------------------------------------
+
+    def wrap(self, text):
+        """wrap(text : string) -> [string]
+
+        Reformat the single paragraph in 'text' so it fits in lines of
+        no more than 'self.width' columns, and return a list of wrapped
+        lines.  Tabs in 'text' are expanded with string.expandtabs(),
+        and all other whitespace characters (including newline) are
+        converted to space.
+        """
+        chunks = self._split_chunks(text)
+        if self.fix_sentence_endings:
+            self._fix_sentence_endings(chunks)
+        return self._wrap_chunks(chunks)
+
+    def fill(self, text):
+        """fill(text : string) -> string
+
+        Reformat the single paragraph in 'text' to fit in lines of no
+        more than 'self.width' columns, and return a new string
+        containing the entire wrapped paragraph.
+        """
+        return "\n".join(self.wrap(text))
+
+
+# -- Convenience interface ---------------------------------------------
+
+def wrap(text, width=70, **kwargs):
+    """Wrap a single paragraph of text, returning a list of wrapped lines.
+
+    Reformat the single paragraph in 'text' so it fits in lines of no
+    more than 'width' columns, and return a list of wrapped lines.  By
+    default, tabs in 'text' are expanded with string.expandtabs(), and
+    all other whitespace characters (including newline) are converted to
+    space.  See TextWrapper class for available keyword args to customize
+    wrapping behaviour.
+    """
+    w = TextWrapper(width=width, **kwargs)
+    return w.wrap(text)
+
+def fill(text, width=70, **kwargs):
+    """Fill a single paragraph of text, returning a new string.
+
+    Reformat the single paragraph in 'text' to fit in lines of no more
+    than 'width' columns, and return a new string containing the entire
+    wrapped paragraph.  As with wrap(), tabs are expanded and other
+    whitespace characters converted to space.  See TextWrapper class for
+    available keyword args to customize wrapping behaviour.
+    """
+    w = TextWrapper(width=width, **kwargs)
+    return w.fill(text)
+
+def shorten(text, width, **kwargs):
+    """Collapse and truncate the given text to fit in the given width.
+
+    The text first has its whitespace collapsed.  If it then fits in
+    the *width*, it is returned as is.  Otherwise, as many words
+    as possible are joined and then the placeholder is appended::
+
+        >>> textwrap.shorten("Hello  world!", width=12)
+        'Hello world!'
+        >>> textwrap.shorten("Hello  world!", width=11)
+        'Hello [...]'
+    """
+    w = TextWrapper(width=width, max_lines=1, **kwargs)
+    return w.fill(' '.join(text.strip().split()))
+
+
+# -- Loosely related functionality -------------------------------------
+
+_whitespace_only_re = re.compile('^[ \t]+$', re.MULTILINE)
+_leading_whitespace_re = re.compile('(^[ \t]*)(?:[^ \t\n])', re.MULTILINE)
+
+def dedent(text):
+    """Remove any common leading whitespace from every line in `text`.
+
+    This can be used to make triple-quoted strings line up with the left
+    edge of the display, while still presenting them in the source code
+    in indented form.
+
+    Note that tabs and spaces are both treated as whitespace, but they
+    are not equal: the lines "  hello" and "\\thello" are
+    considered to have no common leading whitespace.  (This behaviour is
+    new in Python 2.5; older versions of this module incorrectly
+    expanded tabs before searching for common leading whitespace.)
+    """
+    # Look for the longest leading string of spaces and tabs common to
+    # all lines.
+    margin = None
+    text = _whitespace_only_re.sub('', text)
+    indents = _leading_whitespace_re.findall(text)
+    for indent in indents:
+        if margin is None:
+            margin = indent
+
+        # Current line more deeply indented than previous winner:
+        # no change (previous winner is still on top).
+        elif indent.startswith(margin):
+            pass
+
+        # Current line consistent with and no deeper than previous winner:
+        # it's the new winner.
+        elif margin.startswith(indent):
+            margin = indent
+
+        # Find the largest common whitespace between current line and previous
+        # winner.
+        else:
+            for i, (x, y) in enumerate(zip(margin, indent)):
+                if x != y:
+                    margin = margin[:i]
+                    break
+            else:
+                margin = margin[:len(indent)]
+
+    # sanity check (testing/debugging only)
+    if 0 and margin:
+        for line in text.split("\n"):
+            assert not line or line.startswith(margin), \
+                   "line = %r, margin = %r" % (line, margin)
+
+    if margin:
+        text = re.sub(r'(?m)^' + margin, '', text)
+    return text
+
+
+def indent(text, prefix, predicate=None):
+    """Adds 'prefix' to the beginning of selected lines in 'text'.
+
+    If 'predicate' is provided, 'prefix' will only be added to the lines
+    where 'predicate(line)' is True. If 'predicate' is not provided,
+    it will default to adding 'prefix' to all non-empty lines that do not
+    consist solely of whitespace characters.
+    """
+    if predicate is None:
+        def predicate(line):
+            return line.strip()
+
+    def prefixed_lines():
+        for line in text.splitlines(True):
+            yield (prefix + line if predicate(line) else line)
+    return ''.join(prefixed_lines())
+
+
+if __name__ == "__main__":
+    #print dedent("\tfoo\n\tbar")
+    #print dedent("  \thello there\n  \t  how are you?")
+    print(dedent("Hello there.\n  This is indented."))
+
+'''A multi-producer, multi-consumer queue.'''
+
+try:
+    import threading
+except ImportError:
+    import dummy_threading as threading
+from collections import deque
+from heapq import heappush, heappop
+from time import monotonic as time
+
+__all__ = ['Empty', 'Full', 'Queue', 'PriorityQueue', 'LifoQueue']
+
+class Empty(Exception):
+    'Exception raised by Queue.get(block=0)/get_nowait().'
+    pass
+
+class Full(Exception):
+    'Exception raised by Queue.put(block=0)/put_nowait().'
+    pass
+
+class Queue:
+    '''Create a queue object with a given maximum size.
+
+    If maxsize is <= 0, the queue size is infinite.
+    '''
+
+    def __init__(self, maxsize=0):
+        self.maxsize = maxsize
+        self._init(maxsize)
+
+        # mutex must be held whenever the queue is mutating.  All methods
+        # that acquire mutex must release it before returning.  mutex
+        # is shared between the three conditions, so acquiring and
+        # releasing the conditions also acquires and releases mutex.
+        self.mutex = threading.Lock()
+
+        # Notify not_empty whenever an item is added to the queue; a
+        # thread waiting to get is notified then.
+        self.not_empty = threading.Condition(self.mutex)
+
+        # Notify not_full whenever an item is removed from the queue;
+        # a thread waiting to put is notified then.
+        self.not_full = threading.Condition(self.mutex)
+
+        # Notify all_tasks_done whenever the number of unfinished tasks
+        # drops to zero; thread waiting to join() is notified to resume
+        self.all_tasks_done = threading.Condition(self.mutex)
+        self.unfinished_tasks = 0
+
+    def task_done(self):
+        '''Indicate that a formerly enqueued task is complete.
+
+        Used by Queue consumer threads.  For each get() used to fetch a task,
+        a subsequent call to task_done() tells the queue that the processing
+        on the task is complete.
+
+        If a join() is currently blocking, it will resume when all items
+        have been processed (meaning that a task_done() call was received
+        for every item that had been put() into the queue).
+
+        Raises a ValueError if called more times than there were items
+        placed in the queue.
+        '''
+        with self.all_tasks_done:
+            unfinished = self.unfinished_tasks - 1
+            if unfinished <= 0:
+                if unfinished < 0:
+                    raise ValueError('task_done() called too many times')
+                self.all_tasks_done.notify_all()
+            self.unfinished_tasks = unfinished
+
+    def join(self):
+        '''Blocks until all items in the Queue have been gotten and processed.
+
+        The count of unfinished tasks goes up whenever an item is added to the
+        queue. The count goes down whenever a consumer thread calls task_done()
+        to indicate the item was retrieved and all work on it is complete.
+
+        When the count of unfinished tasks drops to zero, join() unblocks.
+        '''
+        with self.all_tasks_done:
+            while self.unfinished_tasks:
+                self.all_tasks_done.wait()
+
+    def qsize(self):
+        '''Return the approximate size of the queue (not reliable!).'''
+        with self.mutex:
+            return self._qsize()
+
+    def empty(self):
+        '''Return True if the queue is empty, False otherwise (not reliable!).
+
+        This method is likely to be removed at some point.  Use qsize() == 0
+        as a direct substitute, but be aware that either approach risks a race
+        condition where a queue can grow before the result of empty() or
+        qsize() can be used.
+
+        To create code that needs to wait for all queued tasks to be
+        completed, the preferred technique is to use the join() method.
+        '''
+        with self.mutex:
+            return not self._qsize()
+
+    def full(self):
+        '''Return True if the queue is full, False otherwise (not reliable!).
+
+        This method is likely to be removed at some point.  Use qsize() >= n
+        as a direct substitute, but be aware that either approach risks a race
+        condition where a queue can shrink before the result of full() or
+        qsize() can be used.
+        '''
+        with self.mutex:
+            return 0 < self.maxsize <= self._qsize()
+
+    def put(self, item, block=True, timeout=None):
+        '''Put an item into the queue.
+
+        If optional args 'block' is true and 'timeout' is None (the default),
+        block if necessary until a free slot is available. If 'timeout' is
+        a non-negative number, it blocks at most 'timeout' seconds and raises
+        the Full exception if no free slot was available within that time.
+        Otherwise ('block' is false), put an item on the queue if a free slot
+        is immediately available, else raise the Full exception ('timeout'
+        is ignored in that case).
+        '''
+        with self.not_full:
+            if self.maxsize > 0:
+                if not block:
+                    if self._qsize() >= self.maxsize:
+                        raise Full
+                elif timeout is None:
+                    while self._qsize() >= self.maxsize:
+                        self.not_full.wait()
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                else:
+                    endtime = time() + timeout
+                    while self._qsize() >= self.maxsize:
+                        remaining = endtime - time()
+                        if remaining <= 0.0:
+                            raise Full
+                        self.not_full.wait(remaining)
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def get(self, block=True, timeout=None):
+        '''Remove and return an item from the queue.
+
+        If optional args 'block' is true and 'timeout' is None (the default),
+        block if necessary until an item is available. If 'timeout' is
+        a non-negative number, it blocks at most 'timeout' seconds and raises
+        the Empty exception if no item was available within that time.
+        Otherwise ('block' is false), return an item if one is immediately
+        available, else raise the Empty exception ('timeout' is ignored
+        in that case).
+        '''
+        with self.not_empty:
+            if not block:
+                if not self._qsize():
+                    raise Empty
+            elif timeout is None:
+                while not self._qsize():
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time() + timeout
+                while not self._qsize():
+                    remaining = endtime - time()
+                    if remaining <= 0.0:
+                        raise Empty
+                    self.not_empty.wait(remaining)
+            item = self._get()
+            self.not_full.notify()
+            return item
+
+    def put_nowait(self, item):
+        '''Put an item into the queue without blocking.
+
+        Only enqueue the item if a free slot is immediately available.
+        Otherwise raise the Full exception.
+        '''
+        return self.put(item, block=False)
+
+    def get_nowait(self):
+        '''Remove and return an item from the queue without blocking.
+
+        Only get an item if one is immediately available. Otherwise
+        raise the Empty exception.
+        '''
+        return self.get(block=False)
+
+    # Override these methods to implement other queue organizations
+    # (e.g. stack or priority queue).
+    # These will only be called with appropriate locks held
+
+    # Initialize the queue representation
+    def _init(self, maxsize):
+        self.queue = deque()
+
+    def _qsize(self):
+        return len(self.queue)
+
+    # Put a new item in the queue
+    def _put(self, item):
+        self.queue.append(item)
+
+    # Get an item from the queue
+    def _get(self):
+        return self.queue.popleft()
+
+
+class PriorityQueue(Queue):
+    '''Variant of Queue that retrieves open entries in priority order (lowest first).
+
+    Entries are typically tuples of the form:  (priority number, data).
+    '''
+
+    def _init(self, maxsize):
+        self.queue = []
+
+    def _qsize(self):
+        return len(self.queue)
+
+    def _put(self, item):
+        heappush(self.queue, item)
+
+    def _get(self):
+        return heappop(self.queue)
+
+
+class LifoQueue(Queue):
+    '''Variant of Queue that retrieves most recently added entries first.'''
+
+    def _init(self, maxsize):
+        self.queue = []
+
+    def _qsize(self):
+        return len(self.queue)
+
+    def _put(self, item):
+        self.queue.append(item)
+
+    def _get(self):
+        return self.queue.pop()
+
+#! /usr/bin/env python3
+
+"""Non-terminal symbols of Python grammar (from "graminit.h")."""
+
+#  This file is automatically generated; please don't muck it up!
+#
+#  To update the symbols in this file, 'cd' to the top directory of
+#  the python source tree after building the interpreter and run:
+#
+#    ./python Lib/symbol.py
+
+#--start constants--
+single_input = 256
+file_input = 257
+eval_input = 258
+decorator = 259
+decorators = 260
+decorated = 261
+async_funcdef = 262
+funcdef = 263
+parameters = 264
+typedargslist = 265
+tfpdef = 266
+varargslist = 267
+vfpdef = 268
+stmt = 269
+simple_stmt = 270
+small_stmt = 271
+expr_stmt = 272
+testlist_star_expr = 273
+augassign = 274
+del_stmt = 275
+pass_stmt = 276
+flow_stmt = 277
+break_stmt = 278
+continue_stmt = 279
+return_stmt = 280
+yield_stmt = 281
+raise_stmt = 282
+import_stmt = 283
+import_name = 284
+import_from = 285
+import_as_name = 286
+dotted_as_name = 287
+import_as_names = 288
+dotted_as_names = 289
+dotted_name = 290
+global_stmt = 291
+nonlocal_stmt = 292
+assert_stmt = 293
+compound_stmt = 294
+async_stmt = 295
+if_stmt = 296
+while_stmt = 297
+for_stmt = 298
+try_stmt = 299
+with_stmt = 300
+with_item = 301
+except_clause = 302
+suite = 303
+test = 304
+test_nocond = 305
+lambdef = 306
+lambdef_nocond = 307
+or_test = 308
+and_test = 309
+not_test = 310
+comparison = 311
+comp_op = 312
+star_expr = 313
+expr = 314
+xor_expr = 315
+and_expr = 316
+shift_expr = 317
+arith_expr = 318
+term = 319
+factor = 320
+power = 321
+atom_expr = 322
+atom = 323
+testlist_comp = 324
+trailer = 325
+subscriptlist = 326
+subscript = 327
+sliceop = 328
+exprlist = 329
+testlist = 330
+dictorsetmaker = 331
+classdef = 332
+arglist = 333
+argument = 334
+comp_iter = 335
+comp_for = 336
+comp_if = 337
+encoding_decl = 338
+yield_expr = 339
+yield_arg = 340
+#--end constants--
+
+sym_name = {}
+for _name, _value in list(globals().items()):
+    if type(_value) is type(0):
+        sym_name[_value] = _name
+
+
+def _main():
+    import sys
+    import token
+    if len(sys.argv) == 1:
+        sys.argv = sys.argv + ["Include/graminit.h", "Lib/symbol.py"]
+    token._main()
+
+if __name__ == "__main__":
+    _main()
+
+"""HMAC (Keyed-Hashing for Message Authentication) Python module.
+
+Implements the HMAC algorithm as described by RFC 2104.
+"""
+
+import warnings as _warnings
+from _operator import _compare_digest as compare_digest
+import hashlib as _hashlib
+
+trans_5C = bytes((x ^ 0x5C) for x in range(256))
+trans_36 = bytes((x ^ 0x36) for x in range(256))
+
+# The size of the digests returned by HMAC depends on the underlying
+# hashing module used.  Use digest_size from the instance of HMAC instead.
+digest_size = None
+
+
+
+class HMAC:
+    """RFC 2104 HMAC class.  Also complies with RFC 4231.
+
+    This supports the API for Cryptographic Hash Functions (PEP 247).
+    """
+    blocksize = 64  # 512-bit HMAC; can be changed in subclasses.
+
+    def __init__(self, key, msg = None, digestmod = None):
+        """Create a new HMAC object.
+
+        key:       key for the keyed hash object.
+        msg:       Initial input for the hash, if provided.
+        digestmod: A module supporting PEP 247.  *OR*
+                   A hashlib constructor returning a new hash object. *OR*
+                   A hash name suitable for hashlib.new().
+                   Defaults to hashlib.md5.
+                   Implicit default to hashlib.md5 is deprecated and will be
+                   removed in Python 3.6.
+
+        Note: key and msg must be a bytes or bytearray objects.
+        """
+
+        if not isinstance(key, (bytes, bytearray)):
+            raise TypeError("key: expected bytes or bytearray, but got %r" % type(key).__name__)
+
+        if digestmod is None:
+            _warnings.warn("HMAC() without an explicit digestmod argument "
+                           "is deprecated.", PendingDeprecationWarning, 2)
+            digestmod = _hashlib.md5
+
+        if callable(digestmod):
+            self.digest_cons = digestmod
+        elif isinstance(digestmod, str):
+            self.digest_cons = lambda d=b'': _hashlib.new(digestmod, d)
+        else:
+            self.digest_cons = lambda d=b'': digestmod.new(d)
+
+        self.outer = self.digest_cons()
+        self.inner = self.digest_cons()
+        self.digest_size = self.inner.digest_size
+
+        if hasattr(self.inner, 'block_size'):
+            blocksize = self.inner.block_size
+            if blocksize < 16:
+                _warnings.warn('block_size of %d seems too small; using our '
+                               'default of %d.' % (blocksize, self.blocksize),
+                               RuntimeWarning, 2)
+                blocksize = self.blocksize
+        else:
+            _warnings.warn('No block_size attribute on given digest object; '
+                           'Assuming %d.' % (self.blocksize),
+                           RuntimeWarning, 2)
+            blocksize = self.blocksize
+
+        # self.blocksize is the default blocksize. self.block_size is
+        # effective block size as well as the public API attribute.
+        self.block_size = blocksize
+
+        if len(key) > blocksize:
+            key = self.digest_cons(key).digest()
+
+        key = key + bytes(blocksize - len(key))
+        self.outer.update(key.translate(trans_5C))
+        self.inner.update(key.translate(trans_36))
+        if msg is not None:
+            self.update(msg)
+
+    @property
+    def name(self):
+        return "hmac-" + self.inner.name
+
+    def update(self, msg):
+        """Update this hashing object with the string msg.
+        """
+        self.inner.update(msg)
+
+    def copy(self):
+        """Return a separate copy of this hashing object.
+
+        An update to this copy won't affect the original object.
+        """
+        # Call __new__ directly to avoid the expensive __init__.
+        other = self.__class__.__new__(self.__class__)
+        other.digest_cons = self.digest_cons
+        other.digest_size = self.digest_size
+        other.inner = self.inner.copy()
+        other.outer = self.outer.copy()
+        return other
+
+    def _current(self):
+        """Return a hash object for the current state.
+
+        To be used only internally with digest() and hexdigest().
+        """
+        h = self.outer.copy()
+        h.update(self.inner.digest())
+        return h
+
+    def digest(self):
+        """Return the hash value of this hashing object.
+
+        This returns a string containing 8-bit data.  The object is
+        not altered in any way by this function; you can continue
+        updating the object after calling this function.
+        """
+        h = self._current()
+        return h.digest()
+
+    def hexdigest(self):
+        """Like digest(), but returns a string of hexadecimal digits instead.
+        """
+        h = self._current()
+        return h.hexdigest()
+
+def new(key, msg = None, digestmod = None):
+    """Create a new hashing object and return it.
+
+    key: The starting key for the hash.
+    msg: if available, will immediately be hashed into the object's starting
+    state.
+
+    You can now feed arbitrary strings into the object using its update()
+    method, and can ask for the hash value at any time by calling its digest()
+    method.
+    """
+    return HMAC(key, msg, digestmod)
+
+#! /usr/bin/env python3
+
+"""Base16, Base32, Base64 (RFC 3548), Base85 and Ascii85 data encodings"""
+
+# Modified 04-Oct-1995 by Jack Jansen to use binascii module
+# Modified 30-Dec-2003 by Barry Warsaw to add full RFC 3548 support
+# Modified 22-May-2007 by Guido van Rossum to use bytes everywhere
+
+import re
+import struct
+import binascii
+
+
+__all__ = [
+    # Legacy interface exports traditional RFC 2045 Base64 encodings
+    'encode', 'decode', 'encodebytes', 'decodebytes',
+    # Generalized interface for other encodings
+    'b64encode', 'b64decode', 'b32encode', 'b32decode',
+    'b16encode', 'b16decode',
+    # Base85 and Ascii85 encodings
+    'b85encode', 'b85decode', 'a85encode', 'a85decode',
+    # Standard Base64 encoding
+    'standard_b64encode', 'standard_b64decode',
+    # Some common Base64 alternatives.  As referenced by RFC 3458, see thread
+    # starting at:
+    #
+    # http://zgp.org/pipermail/p2p-hackers/2001-September/000316.html
+    'urlsafe_b64encode', 'urlsafe_b64decode',
+    ]
+
+
+bytes_types = (bytes, bytearray)  # Types acceptable as binary data
+
+def _bytes_from_decode_data(s):
+    if isinstance(s, str):
+        try:
+            return s.encode('ascii')
+        except UnicodeEncodeError:
+            raise ValueError('string argument should contain only ASCII characters')
+    if isinstance(s, bytes_types):
+        return s
+    try:
+        return memoryview(s).tobytes()
+    except TypeError:
+        raise TypeError("argument should be a bytes-like object or ASCII "
+                        "string, not %r" % s.__class__.__name__) from None
+
+
+# Base64 encoding/decoding uses binascii
+
+def b64encode(s, altchars=None):
+    """Encode the bytes-like object s using Base64 and return a bytes object.
+
+    Optional altchars should be a byte string of length 2 which specifies an
+    alternative alphabet for the '+' and '/' characters.  This allows an
+    application to e.g. generate url or filesystem safe Base64 strings.
+    """
+    # Strip off the trailing newline
+    encoded = binascii.b2a_base64(s)[:-1]
+    if altchars is not None:
+        assert len(altchars) == 2, repr(altchars)
+        return encoded.translate(bytes.maketrans(b'+/', altchars))
+    return encoded
+
+
+def b64decode(s, altchars=None, validate=False):
+    """Decode the Base64 encoded bytes-like object or ASCII string s.
+
+    Optional altchars must be a bytes-like object or ASCII string of length 2
+    which specifies the alternative alphabet used instead of the '+' and '/'
+    characters.
+
+    The result is returned as a bytes object.  A binascii.Error is raised if
+    s is incorrectly padded.
+
+    If validate is False (the default), characters that are neither in the
+    normal base-64 alphabet nor the alternative alphabet are discarded prior
+    to the padding check.  If validate is True, these non-alphabet characters
+    in the input result in a binascii.Error.
+    """
+    s = _bytes_from_decode_data(s)
+    if altchars is not None:
+        altchars = _bytes_from_decode_data(altchars)
+        assert len(altchars) == 2, repr(altchars)
+        s = s.translate(bytes.maketrans(altchars, b'+/'))
+    if validate and not re.match(b'^[A-Za-z0-9+/]*={0,2}$', s):
+        raise binascii.Error('Non-base64 digit found')
+    return binascii.a2b_base64(s)
+
+
+def standard_b64encode(s):
+    """Encode bytes-like object s using the standard Base64 alphabet.
+
+    The result is returned as a bytes object.
+    """
+    return b64encode(s)
+
+def standard_b64decode(s):
+    """Decode bytes encoded with the standard Base64 alphabet.
+
+    Argument s is a bytes-like object or ASCII string to decode.  The result
+    is returned as a bytes object.  A binascii.Error is raised if the input
+    is incorrectly padded.  Characters that are not in the standard alphabet
+    are discarded prior to the padding check.
+    """
+    return b64decode(s)
+
+
+_urlsafe_encode_translation = bytes.maketrans(b'+/', b'-_')
+_urlsafe_decode_translation = bytes.maketrans(b'-_', b'+/')
+
+def urlsafe_b64encode(s):
+    """Encode bytes using the URL- and filesystem-safe Base64 alphabet.
+
+    Argument s is a bytes-like object to encode.  The result is returned as a
+    bytes object.  The alphabet uses '-' instead of '+' and '_' instead of
+    '/'.
+    """
+    return b64encode(s).translate(_urlsafe_encode_translation)
+
+def urlsafe_b64decode(s):
+    """Decode bytes using the URL- and filesystem-safe Base64 alphabet.
+
+    Argument s is a bytes-like object or ASCII string to decode.  The result
+    is returned as a bytes object.  A binascii.Error is raised if the input
+    is incorrectly padded.  Characters that are not in the URL-safe base-64
+    alphabet, and are not a plus '+' or slash '/', are discarded prior to the
+    padding check.
+
+    The alphabet uses '-' instead of '+' and '_' instead of '/'.
+    """
+    s = _bytes_from_decode_data(s)
+    s = s.translate(_urlsafe_decode_translation)
+    return b64decode(s)
+
+
+
+# Base32 encoding/decoding must be done in Python
+_b32alphabet = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+_b32tab2 = None
+_b32rev = None
+
+def b32encode(s):
+    """Encode the bytes-like object s using Base32 and return a bytes object.
+    """
+    global _b32tab2
+    # Delay the initialization of the table to not waste memory
+    # if the function is never called
+    if _b32tab2 is None:
+        b32tab = [bytes((i,)) for i in _b32alphabet]
+        _b32tab2 = [a + b for a in b32tab for b in b32tab]
+        b32tab = None
+
+    if not isinstance(s, bytes_types):
+        s = memoryview(s).tobytes()
+    leftover = len(s) % 5
+    # Pad the last quantum with zero bits if necessary
+    if leftover:
+        s = s + bytes(5 - leftover)  # Don't use += !
+    encoded = bytearray()
+    from_bytes = int.from_bytes
+    b32tab2 = _b32tab2
+    for i in range(0, len(s), 5):
+        c = from_bytes(s[i: i + 5], 'big')
+        encoded += (b32tab2[c >> 30] +           # bits 1 - 10
+                    b32tab2[(c >> 20) & 0x3ff] + # bits 11 - 20
+                    b32tab2[(c >> 10) & 0x3ff] + # bits 21 - 30
+                    b32tab2[c & 0x3ff]           # bits 31 - 40
+                   )
+    # Adjust for any leftover partial quanta
+    if leftover == 1:
+        encoded[-6:] = b'======'
+    elif leftover == 2:
+        encoded[-4:] = b'===='
+    elif leftover == 3:
+        encoded[-3:] = b'==='
+    elif leftover == 4:
+        encoded[-1:] = b'='
+    return bytes(encoded)
+
+def b32decode(s, casefold=False, map01=None):
+    """Decode the Base32 encoded bytes-like object or ASCII string s.
+
+    Optional casefold is a flag specifying whether a lowercase alphabet is
+    acceptable as input.  For security purposes, the default is False.
+
+    RFC 3548 allows for optional mapping of the digit 0 (zero) to the
+    letter O (oh), and for optional mapping of the digit 1 (one) to
+    either the letter I (eye) or letter L (el).  The optional argument
+    map01 when not None, specifies which letter the digit 1 should be
+    mapped to (when map01 is not None, the digit 0 is always mapped to
+    the letter O).  For security purposes the default is None, so that
+    0 and 1 are not allowed in the input.
+
+    The result is returned as a bytes object.  A binascii.Error is raised if
+    the input is incorrectly padded or if there are non-alphabet
+    characters present in the input.
+    """
+    global _b32rev
+    # Delay the initialization of the table to not waste memory
+    # if the function is never called
+    if _b32rev is None:
+        _b32rev = {v: k for k, v in enumerate(_b32alphabet)}
+    s = _bytes_from_decode_data(s)
+    if len(s) % 8:
+        raise binascii.Error('Incorrect padding')
+    # Handle section 2.4 zero and one mapping.  The flag map01 will be either
+    # False, or the character to map the digit 1 (one) to.  It should be
+    # either L (el) or I (eye).
+    if map01 is not None:
+        map01 = _bytes_from_decode_data(map01)
+        assert len(map01) == 1, repr(map01)
+        s = s.translate(bytes.maketrans(b'01', b'O' + map01))
+    if casefold:
+        s = s.upper()
+    # Strip off pad characters from the right.  We need to count the pad
+    # characters because this will tell us how many null bytes to remove from
+    # the end of the decoded string.
+    l = len(s)
+    s = s.rstrip(b'=')
+    padchars = l - len(s)
+    # Now decode the full quanta
+    decoded = bytearray()
+    b32rev = _b32rev
+    for i in range(0, len(s), 8):
+        quanta = s[i: i + 8]
+        acc = 0
+        try:
+            for c in quanta:
+                acc = (acc << 5) + b32rev[c]
+        except KeyError:
+            raise binascii.Error('Non-base32 digit found') from None
+        decoded += acc.to_bytes(5, 'big')
+    # Process the last, partial quanta
+    if padchars:
+        acc <<= 5 * padchars
+        last = acc.to_bytes(5, 'big')
+        if padchars == 1:
+            decoded[-5:] = last[:-1]
+        elif padchars == 3:
+            decoded[-5:] = last[:-2]
+        elif padchars == 4:
+            decoded[-5:] = last[:-3]
+        elif padchars == 6:
+            decoded[-5:] = last[:-4]
+        else:
+            raise binascii.Error('Incorrect padding')
+    return bytes(decoded)
+
+
+
+# RFC 3548, Base 16 Alphabet specifies uppercase, but hexlify() returns
+# lowercase.  The RFC also recommends against accepting input case
+# insensitively.
+def b16encode(s):
+    """Encode the bytes-like object s using Base16 and return a bytes object.
+    """
+    return binascii.hexlify(s).upper()
+
+
+def b16decode(s, casefold=False):
+    """Decode the Base16 encoded bytes-like object or ASCII string s.
+
+    Optional casefold is a flag specifying whether a lowercase alphabet is
+    acceptable as input.  For security purposes, the default is False.
+
+    The result is returned as a bytes object.  A binascii.Error is raised if
+    s is incorrectly padded or if there are non-alphabet characters present
+    in the input.
+    """
+    s = _bytes_from_decode_data(s)
+    if casefold:
+        s = s.upper()
+    if re.search(b'[^0-9A-F]', s):
+        raise binascii.Error('Non-base16 digit found')
+    return binascii.unhexlify(s)
+
+#
+# Ascii85 encoding/decoding
+#
+
+_a85chars = None
+_a85chars2 = None
+_A85START = b"<~"
+_A85END = b"~>"
+
+def _85encode(b, chars, chars2, pad=False, foldnuls=False, foldspaces=False):
+    # Helper function for a85encode and b85encode
+    if not isinstance(b, bytes_types):
+        b = memoryview(b).tobytes()
+
+    padding = (-len(b)) % 4
+    if padding:
+        b = b + b'\0' * padding
+    words = struct.Struct('!%dI' % (len(b) // 4)).unpack(b)
+
+    chunks = [b'z' if foldnuls and not word else
+              b'y' if foldspaces and word == 0x20202020 else
+              (chars2[word // 614125] +
+               chars2[word // 85 % 7225] +
+               chars[word % 85])
+              for word in words]
+
+    if padding and not pad:
+        if chunks[-1] == b'z':
+            chunks[-1] = chars[0] * 5
+        chunks[-1] = chunks[-1][:-padding]
+
+    return b''.join(chunks)
+
+def a85encode(b, *, foldspaces=False, wrapcol=0, pad=False, adobe=False):
+    """Encode bytes-like object b using Ascii85 and return a bytes object.
+
+    foldspaces is an optional flag that uses the special short sequence 'y'
+    instead of 4 consecutive spaces (ASCII 0x20) as supported by 'btoa'. This
+    feature is not supported by the "standard" Adobe encoding.
+
+    wrapcol controls whether the output should have newline (b'\\n') characters
+    added to it. If this is non-zero, each output line will be at most this
+    many characters long.
+
+    pad controls whether the input is padded to a multiple of 4 before
+    encoding. Note that the btoa implementation always pads.
+
+    adobe controls whether the encoded byte sequence is framed with <~ and ~>,
+    which is used by the Adobe implementation.
+    """
+    global _a85chars, _a85chars2
+    # Delay the initialization of tables to not waste memory
+    # if the function is never called
+    if _a85chars is None:
+        _a85chars = [bytes((i,)) for i in range(33, 118)]
+        _a85chars2 = [(a + b) for a in _a85chars for b in _a85chars]
+
+    result = _85encode(b, _a85chars, _a85chars2, pad, True, foldspaces)
+
+    if adobe:
+        result = _A85START + result
+    if wrapcol:
+        wrapcol = max(2 if adobe else 1, wrapcol)
+        chunks = [result[i: i + wrapcol]
+                  for i in range(0, len(result), wrapcol)]
+        if adobe:
+            if len(chunks[-1]) + 2 > wrapcol:
+                chunks.append(b'')
+        result = b'\n'.join(chunks)
+    if adobe:
+        result += _A85END
+
+    return result
+
+def a85decode(b, *, foldspaces=False, adobe=False, ignorechars=b' \t\n\r\v'):
+    """Decode the Ascii85 encoded bytes-like object or ASCII string b.
+
+    foldspaces is a flag that specifies whether the 'y' short sequence should be
+    accepted as shorthand for 4 consecutive spaces (ASCII 0x20). This feature is
+    not supported by the "standard" Adobe encoding.
+
+    adobe controls whether the input sequence is in Adobe Ascii85 format (i.e.
+    is framed with <~ and ~>).
+
+    ignorechars should be a byte string containing characters to ignore from the
+    input. This should only contain whitespace characters, and by default
+    contains all whitespace characters in ASCII.
+
+    The result is returned as a bytes object.
+    """
+    b = _bytes_from_decode_data(b)
+    if adobe:
+        if not b.endswith(_A85END):
+            raise ValueError(
+                "Ascii85 encoded byte sequences must end "
+                "with {!r}".format(_A85END)
+                )
+        if b.startswith(_A85START):
+            b = b[2:-2]  # Strip off start/end markers
+        else:
+            b = b[:-2]
+    #
+    # We have to go through this stepwise, so as to ignore spaces and handle
+    # special short sequences
+    #
+    packI = struct.Struct('!I').pack
+    decoded = []
+    decoded_append = decoded.append
+    curr = []
+    curr_append = curr.append
+    curr_clear = curr.clear
+    for x in b + b'u' * 4:
+        if b'!'[0] <= x <= b'u'[0]:
+            curr_append(x)
+            if len(curr) == 5:
+                acc = 0
+                for x in curr:
+                    acc = 85 * acc + (x - 33)
+                try:
+                    decoded_append(packI(acc))
+                except struct.error:
+                    raise ValueError('Ascii85 overflow') from None
+                curr_clear()
+        elif x == b'z'[0]:
+            if curr:
+                raise ValueError('z inside Ascii85 5-tuple')
+            decoded_append(b'\0\0\0\0')
+        elif foldspaces and x == b'y'[0]:
+            if curr:
+                raise ValueError('y inside Ascii85 5-tuple')
+            decoded_append(b'\x20\x20\x20\x20')
+        elif x in ignorechars:
+            # Skip whitespace
+            continue
+        else:
+            raise ValueError('Non-Ascii85 digit found: %c' % x)
+
+    result = b''.join(decoded)
+    padding = 4 - len(curr)
+    if padding:
+        # Throw away the extra padding
+        result = result[:-padding]
+    return result
+
+# The following code is originally taken (with permission) from Mercurial
+
+_b85alphabet = (b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                b"abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~")
+_b85chars = None
+_b85chars2 = None
+_b85dec = None
+
+def b85encode(b, pad=False):
+    """Encode bytes-like object b in base85 format and return a bytes object.
+
+    If pad is true, the input is padded with b'\\0' so its length is a multiple of
+    4 bytes before encoding.
+    """
+    global _b85chars, _b85chars2
+    # Delay the initialization of tables to not waste memory
+    # if the function is never called
+    if _b85chars is None:
+        _b85chars = [bytes((i,)) for i in _b85alphabet]
+        _b85chars2 = [(a + b) for a in _b85chars for b in _b85chars]
+    return _85encode(b, _b85chars, _b85chars2, pad)
+
+def b85decode(b):
+    """Decode the base85-encoded bytes-like object or ASCII string b
+
+    The result is returned as a bytes object.
+    """
+    global _b85dec
+    # Delay the initialization of tables to not waste memory
+    # if the function is never called
+    if _b85dec is None:
+        _b85dec = [None] * 256
+        for i, c in enumerate(_b85alphabet):
+            _b85dec[c] = i
+
+    b = _bytes_from_decode_data(b)
+    padding = (-len(b)) % 5
+    b = b + b'~' * padding
+    out = []
+    packI = struct.Struct('!I').pack
+    for i in range(0, len(b), 5):
+        chunk = b[i:i + 5]
+        acc = 0
+        try:
+            for c in chunk:
+                acc = acc * 85 + _b85dec[c]
+        except TypeError:
+            for j, c in enumerate(chunk):
+                if _b85dec[c] is None:
+                    raise ValueError('bad base85 character at position %d'
+                                    % (i + j)) from None
+            raise
+        try:
+            out.append(packI(acc))
+        except struct.error:
+            raise ValueError('base85 overflow in hunk starting at byte %d'
+                             % i) from None
+
+    result = b''.join(out)
+    if padding:
+        result = result[:-padding]
+    return result
+
+# Legacy interface.  This code could be cleaned up since I don't believe
+# binascii has any line length limitations.  It just doesn't seem worth it
+# though.  The files should be opened in binary mode.
+
+MAXLINESIZE = 76 # Excluding the CRLF
+MAXBINSIZE = (MAXLINESIZE//4)*3
+
+def encode(input, output):
+    """Encode a file; input and output are binary files."""
+    while True:
+        s = input.read(MAXBINSIZE)
+        if not s:
+            break
+        while len(s) < MAXBINSIZE:
+            ns = input.read(MAXBINSIZE-len(s))
+            if not ns:
+                break
+            s += ns
+        line = binascii.b2a_base64(s)
+        output.write(line)
+
+
+def decode(input, output):
+    """Decode a file; input and output are binary files."""
+    while True:
+        line = input.readline()
+        if not line:
+            break
+        s = binascii.a2b_base64(line)
+        output.write(s)
+
+def _input_type_check(s):
+    try:
+        m = memoryview(s)
+    except TypeError as err:
+        msg = "expected bytes-like object, not %s" % s.__class__.__name__
+        raise TypeError(msg) from err
+    if m.format not in ('c', 'b', 'B'):
+        msg = ("expected single byte elements, not %r from %s" %
+                                          (m.format, s.__class__.__name__))
+        raise TypeError(msg)
+    if m.ndim != 1:
+        msg = ("expected 1-D data, not %d-D data from %s" %
+                                          (m.ndim, s.__class__.__name__))
+        raise TypeError(msg)
+
+
+def encodebytes(s):
+    """Encode a bytestring into a bytes object containing multiple lines
+    of base-64 data."""
+    _input_type_check(s)
+    pieces = []
+    for i in range(0, len(s), MAXBINSIZE):
+        chunk = s[i : i + MAXBINSIZE]
+        pieces.append(binascii.b2a_base64(chunk))
+    return b"".join(pieces)
+
+def encodestring(s):
+    """Legacy alias of encodebytes()."""
+    import warnings
+    warnings.warn("encodestring() is a deprecated alias since 3.1, "
+                  "use encodebytes()",
+                  DeprecationWarning, 2)
+    return encodebytes(s)
+
+
+def decodebytes(s):
+    """Decode a bytestring of base-64 data into a bytes object."""
+    _input_type_check(s)
+    return binascii.a2b_base64(s)
+
+def decodestring(s):
+    """Legacy alias of decodebytes()."""
+    import warnings
+    warnings.warn("decodestring() is a deprecated alias since Python 3.1, "
+                  "use decodebytes()",
+                  DeprecationWarning, 2)
+    return decodebytes(s)
+
+
+# Usable as a script...
+def main():
+    """Small main program"""
+    import sys, getopt
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'deut')
+    except getopt.error as msg:
+        sys.stdout = sys.stderr
+        print(msg)
+        print("""usage: %s [-d|-e|-u|-t] [file|-]
+        -d, -u: decode
+        -e: encode (default)
+        -t: encode and decode string 'Aladdin:open sesame'"""%sys.argv[0])
+        sys.exit(2)
+    func = encode
+    for o, a in opts:
+        if o == '-e': func = encode
+        if o == '-d': func = decode
+        if o == '-u': func = decode
+        if o == '-t': test(); return
+    if args and args[0] != '-':
+        with open(args[0], 'rb') as f:
+            func(f, sys.stdout.buffer)
+    else:
+        func(sys.stdin.buffer, sys.stdout.buffer)
+
+
+def test():
+    s0 = b"Aladdin:open sesame"
+    print(repr(s0))
+    s1 = encodebytes(s0)
+    print(repr(s1))
+    s2 = decodebytes(s1)
+    print(repr(s2))
+    assert s0 == s2
+
+
+if __name__ == '__main__':
+    main()
+
+"""Strptime-related classes and functions.
+
+CLASSES:
+    LocaleTime -- Discovers and stores locale-specific time information
+    TimeRE -- Creates regexes for pattern matching a string of text containing
+                time information
+
+FUNCTIONS:
+    _getlang -- Figure out what language is being used for the locale
+    strptime -- Calculates the time struct represented by the passed-in string
+
+"""
+import time
+import locale
+import calendar
+from re import compile as re_compile
+from re import IGNORECASE
+from re import escape as re_escape
+from datetime import (date as datetime_date,
+                      timedelta as datetime_timedelta,
+                      timezone as datetime_timezone)
+try:
+    from _thread import allocate_lock as _thread_allocate_lock
+except ImportError:
+    from _dummy_thread import allocate_lock as _thread_allocate_lock
+
+__all__ = []
+
+def _getlang():
+    # Figure out what the current language is set to.
+    return locale.getlocale(locale.LC_TIME)
+
+class LocaleTime(object):
+    """Stores and handles locale-specific information related to time.
+
+    ATTRIBUTES:
+        f_weekday -- full weekday names (7-item list)
+        a_weekday -- abbreviated weekday names (7-item list)
+        f_month -- full month names (13-item list; dummy value in [0], which
+                    is added by code)
+        a_month -- abbreviated month names (13-item list, dummy value in
+                    [0], which is added by code)
+        am_pm -- AM/PM representation (2-item list)
+        LC_date_time -- format string for date/time representation (string)
+        LC_date -- format string for date representation (string)
+        LC_time -- format string for time representation (string)
+        timezone -- daylight- and non-daylight-savings timezone representation
+                    (2-item list of sets)
+        lang -- Language used by instance (2-item tuple)
+    """
+
+    def __init__(self):
+        """Set all attributes.
+
+        Order of methods called matters for dependency reasons.
+
+        The locale language is set at the offset and then checked again before
+        exiting.  This is to make sure that the attributes were not set with a
+        mix of information from more than one locale.  This would most likely
+        happen when using threads where one thread calls a locale-dependent
+        function while another thread changes the locale while the function in
+        the other thread is still running.  Proper coding would call for
+        locks to prevent changing the locale while locale-dependent code is
+        running.  The check here is done in case someone does not think about
+        doing this.
+
+        Only other possible issue is if someone changed the timezone and did
+        not call tz.tzset .  That is an issue for the programmer, though,
+        since changing the timezone is worthless without that call.
+
+        """
+        self.lang = _getlang()
+        self.__calc_weekday()
+        self.__calc_month()
+        self.__calc_am_pm()
+        self.__calc_timezone()
+        self.__calc_date_time()
+        if _getlang() != self.lang:
+            raise ValueError("locale changed during initialization")
+        if time.tzname != self.tzname or time.daylight != self.daylight:
+            raise ValueError("timezone changed during initialization")
+
+    def __pad(self, seq, front):
+        # Add '' to seq to either the front (is True), else the back.
+        seq = list(seq)
+        if front:
+            seq.insert(0, '')
+        else:
+            seq.append('')
+        return seq
+
+    def __calc_weekday(self):
+        # Set self.a_weekday and self.f_weekday using the calendar
+        # module.
+        a_weekday = [calendar.day_abbr[i].lower() for i in range(7)]
+        f_weekday = [calendar.day_name[i].lower() for i in range(7)]
+        self.a_weekday = a_weekday
+        self.f_weekday = f_weekday
+
+    def __calc_month(self):
+        # Set self.f_month and self.a_month using the calendar module.
+        a_month = [calendar.month_abbr[i].lower() for i in range(13)]
+        f_month = [calendar.month_name[i].lower() for i in range(13)]
+        self.a_month = a_month
+        self.f_month = f_month
+
+    def __calc_am_pm(self):
+        # Set self.am_pm by using time.strftime().
+
+        # The magic date (1999,3,17,hour,44,55,2,76,0) is not really that
+        # magical; just happened to have used it everywhere else where a
+        # static date was needed.
+        am_pm = []
+        for hour in (1, 22):
+            time_tuple = time.struct_time((1999,3,17,hour,44,55,2,76,0))
+            am_pm.append(time.strftime("%p", time_tuple).lower())
+        self.am_pm = am_pm
+
+    def __calc_date_time(self):
+        # Set self.date_time, self.date, & self.time by using
+        # time.strftime().
+
+        # Use (1999,3,17,22,44,55,2,76,0) for magic date because the amount of
+        # overloaded numbers is minimized.  The order in which searches for
+        # values within the format string is very important; it eliminates
+        # possible ambiguity for what something represents.
+        time_tuple = time.struct_time((1999,3,17,22,44,55,2,76,0))
+        date_time = [None, None, None]
+        date_time[0] = time.strftime("%c", time_tuple).lower()
+        date_time[1] = time.strftime("%x", time_tuple).lower()
+        date_time[2] = time.strftime("%X", time_tuple).lower()
+        replacement_pairs = [('%', '%%'), (self.f_weekday[2], '%A'),
+                    (self.f_month[3], '%B'), (self.a_weekday[2], '%a'),
+                    (self.a_month[3], '%b'), (self.am_pm[1], '%p'),
+                    ('1999', '%Y'), ('99', '%y'), ('22', '%H'),
+                    ('44', '%M'), ('55', '%S'), ('76', '%j'),
+                    ('17', '%d'), ('03', '%m'), ('3', '%m'),
+                    # '3' needed for when no leading zero.
+                    ('2', '%w'), ('10', '%I')]
+        replacement_pairs.extend([(tz, "%Z") for tz_values in self.timezone
+                                                for tz in tz_values])
+        for offset,directive in ((0,'%c'), (1,'%x'), (2,'%X')):
+            current_format = date_time[offset]
+            for old, new in replacement_pairs:
+                # Must deal with possible lack of locale info
+                # manifesting itself as the empty string (e.g., Swedish's
+                # lack of AM/PM info) or a platform returning a tuple of empty
+                # strings (e.g., MacOS 9 having timezone as ('','')).
+                if old:
+                    current_format = current_format.replace(old, new)
+            # If %W is used, then Sunday, 2005-01-03 will fall on week 0 since
+            # 2005-01-03 occurs before the first Monday of the year.  Otherwise
+            # %U is used.
+            time_tuple = time.struct_time((1999,1,3,1,1,1,6,3,0))
+            if '00' in time.strftime(directive, time_tuple):
+                U_W = '%W'
+            else:
+                U_W = '%U'
+            date_time[offset] = current_format.replace('11', U_W)
+        self.LC_date_time = date_time[0]
+        self.LC_date = date_time[1]
+        self.LC_time = date_time[2]
+
+    def __calc_timezone(self):
+        # Set self.timezone by using time.tzname.
+        # Do not worry about possibility of time.tzname[0] == time.tzname[1]
+        # and time.daylight; handle that in strptime.
+        try:
+            time.tzset()
+        except AttributeError:
+            pass
+        self.tzname = time.tzname
+        self.daylight = time.daylight
+        no_saving = frozenset({"utc", "gmt", self.tzname[0].lower()})
+        if self.daylight:
+            has_saving = frozenset({self.tzname[1].lower()})
+        else:
+            has_saving = frozenset()
+        self.timezone = (no_saving, has_saving)
+
+
+class TimeRE(dict):
+    """Handle conversion from format directives to regexes."""
+
+    def __init__(self, locale_time=None):
+        """Create keys/values.
+
+        Order of execution is important for dependency reasons.
+
+        """
+        if locale_time:
+            self.locale_time = locale_time
+        else:
+            self.locale_time = LocaleTime()
+        base = super()
+        base.__init__({
+            # The " \d" part of the regex is to make %c from ANSI C work
+            'd': r"(?P<d>3[0-1]|[1-2]\d|0[1-9]|[1-9]| [1-9])",
+            'f': r"(?P<f>[0-9]{1,6})",
+            'H': r"(?P<H>2[0-3]|[0-1]\d|\d)",
+            'I': r"(?P<I>1[0-2]|0[1-9]|[1-9])",
+            'j': r"(?P<j>36[0-6]|3[0-5]\d|[1-2]\d\d|0[1-9]\d|00[1-9]|[1-9]\d|0[1-9]|[1-9])",
+            'm': r"(?P<m>1[0-2]|0[1-9]|[1-9])",
+            'M': r"(?P<M>[0-5]\d|\d)",
+            'S': r"(?P<S>6[0-1]|[0-5]\d|\d)",
+            'U': r"(?P<U>5[0-3]|[0-4]\d|\d)",
+            'w': r"(?P<w>[0-6])",
+            # W is set below by using 'U'
+            'y': r"(?P<y>\d\d)",
+            #XXX: Does 'Y' need to worry about having less or more than
+            #     4 digits?
+            'Y': r"(?P<Y>\d\d\d\d)",
+            'z': r"(?P<z>[+-]\d\d[0-5]\d)",
+            'A': self.__seqToRE(self.locale_time.f_weekday, 'A'),
+            'a': self.__seqToRE(self.locale_time.a_weekday, 'a'),
+            'B': self.__seqToRE(self.locale_time.f_month[1:], 'B'),
+            'b': self.__seqToRE(self.locale_time.a_month[1:], 'b'),
+            'p': self.__seqToRE(self.locale_time.am_pm, 'p'),
+            'Z': self.__seqToRE((tz for tz_names in self.locale_time.timezone
+                                        for tz in tz_names),
+                                'Z'),
+            '%': '%'})
+        base.__setitem__('W', base.__getitem__('U').replace('U', 'W'))
+        base.__setitem__('c', self.pattern(self.locale_time.LC_date_time))
+        base.__setitem__('x', self.pattern(self.locale_time.LC_date))
+        base.__setitem__('X', self.pattern(self.locale_time.LC_time))
+
+    def __seqToRE(self, to_convert, directive):
+        """Convert a list to a regex string for matching a directive.
+
+        Want possible matching values to be from longest to shortest.  This
+        prevents the possibility of a match occurring for a value that also
+        a substring of a larger value that should have matched (e.g., 'abc'
+        matching when 'abcdef' should have been the match).
+
+        """
+        to_convert = sorted(to_convert, key=len, reverse=True)
+        for value in to_convert:
+            if value != '':
+                break
+        else:
+            return ''
+        regex = '|'.join(re_escape(stuff) for stuff in to_convert)
+        regex = '(?P<%s>%s' % (directive, regex)
+        return '%s)' % regex
+
+    def pattern(self, format):
+        """Return regex pattern for the format string.
+
+        Need to make sure that any characters that might be interpreted as
+        regex syntax are escaped.
+
+        """
+        processed_format = ''
+        # The sub() call escapes all characters that might be misconstrued
+        # as regex syntax.  Cannot use re.escape since we have to deal with
+        # format directives (%m, etc.).
+        regex_chars = re_compile(r"([\\.^$*+?\(\){}\[\]|])")
+        format = regex_chars.sub(r"\\\1", format)
+        whitespace_replacement = re_compile(r'\s+')
+        format = whitespace_replacement.sub(r'\\s+', format)
+        while '%' in format:
+            directive_index = format.index('%')+1
+            processed_format = "%s%s%s" % (processed_format,
+                                           format[:directive_index-1],
+                                           self[format[directive_index]])
+            format = format[directive_index+1:]
+        return "%s%s" % (processed_format, format)
+
+    def compile(self, format):
+        """Return a compiled re object for the format string."""
+        return re_compile(self.pattern(format), IGNORECASE)
+
+_cache_lock = _thread_allocate_lock()
+# DO NOT modify _TimeRE_cache or _regex_cache without acquiring the cache lock
+# first!
+_TimeRE_cache = TimeRE()
+_CACHE_MAX_SIZE = 5 # Max number of regexes stored in _regex_cache
+_regex_cache = {}
+
+def _calc_julian_from_U_or_W(year, week_of_year, day_of_week, week_starts_Mon):
+    """Calculate the Julian day based on the year, week of the year, and day of
+    the week, with week_start_day representing whether the week of the year
+    assumes the week starts on Sunday or Monday (6 or 0)."""
+    first_weekday = datetime_date(year, 1, 1).weekday()
+    # If we are dealing with the %U directive (week starts on Sunday), it's
+    # easier to just shift the view to Sunday being the first day of the
+    # week.
+    if not week_starts_Mon:
+        first_weekday = (first_weekday + 1) % 7
+        day_of_week = (day_of_week + 1) % 7
+    # Need to watch out for a week 0 (when the first day of the year is not
+    # the same as that specified by %U or %W).
+    week_0_length = (7 - first_weekday) % 7
+    if week_of_year == 0:
+        return 1 + day_of_week - first_weekday
+    else:
+        days_to_week = week_0_length + (7 * (week_of_year - 1))
+        return 1 + days_to_week + day_of_week
+
+
+def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
+    """Return a 2-tuple consisting of a time struct and an int containing
+    the number of microseconds based on the input string and the
+    format string."""
+
+    for index, arg in enumerate([data_string, format]):
+        if not isinstance(arg, str):
+            msg = "strptime() argument {} must be str, not {}"
+            raise TypeError(msg.format(index, type(arg)))
+
+    global _TimeRE_cache, _regex_cache
+    with _cache_lock:
+        locale_time = _TimeRE_cache.locale_time
+        if (_getlang() != locale_time.lang or
+            time.tzname != locale_time.tzname or
+            time.daylight != locale_time.daylight):
+            _TimeRE_cache = TimeRE()
+            _regex_cache.clear()
+            locale_time = _TimeRE_cache.locale_time
+        if len(_regex_cache) > _CACHE_MAX_SIZE:
+            _regex_cache.clear()
+        format_regex = _regex_cache.get(format)
+        if not format_regex:
+            try:
+                format_regex = _TimeRE_cache.compile(format)
+            # KeyError raised when a bad format is found; can be specified as
+            # \\, in which case it was a stray % but with a space after it
+            except KeyError as err:
+                bad_directive = err.args[0]
+                if bad_directive == "\\":
+                    bad_directive = "%"
+                del err
+                raise ValueError("'%s' is a bad directive in format '%s'" %
+                                    (bad_directive, format)) from None
+            # IndexError only occurs when the format string is "%"
+            except IndexError:
+                raise ValueError("stray %% in format '%s'" % format) from None
+            _regex_cache[format] = format_regex
+    found = format_regex.match(data_string)
+    if not found:
+        raise ValueError("time data %r does not match format %r" %
+                         (data_string, format))
+    if len(data_string) != found.end():
+        raise ValueError("unconverted data remains: %s" %
+                          data_string[found.end():])
+
+    year = None
+    month = day = 1
+    hour = minute = second = fraction = 0
+    tz = -1
+    tzoffset = None
+    # Default to -1 to signify that values not known; not critical to have,
+    # though
+    week_of_year = -1
+    week_of_year_start = -1
+    # weekday and julian defaulted to None so as to signal need to calculate
+    # values
+    weekday = julian = None
+    found_dict = found.groupdict()
+    for group_key in found_dict.keys():
+        # Directives not explicitly handled below:
+        #   c, x, X
+        #      handled by making out of other directives
+        #   U, W
+        #      worthless without day of the week
+        if group_key == 'y':
+            year = int(found_dict['y'])
+            # Open Group specification for strptime() states that a %y
+            #value in the range of [00, 68] is in the century 2000, while
+            #[69,99] is in the century 1900
+            if year <= 68:
+                year += 2000
+            else:
+                year += 1900
+        elif group_key == 'Y':
+            year = int(found_dict['Y'])
+        elif group_key == 'm':
+            month = int(found_dict['m'])
+        elif group_key == 'B':
+            month = locale_time.f_month.index(found_dict['B'].lower())
+        elif group_key == 'b':
+            month = locale_time.a_month.index(found_dict['b'].lower())
+        elif group_key == 'd':
+            day = int(found_dict['d'])
+        elif group_key == 'H':
+            hour = int(found_dict['H'])
+        elif group_key == 'I':
+            hour = int(found_dict['I'])
+            ampm = found_dict.get('p', '').lower()
+            # If there was no AM/PM indicator, we'll treat this like AM
+            if ampm in ('', locale_time.am_pm[0]):
+                # We're in AM so the hour is correct unless we're
+                # looking at 12 midnight.
+                # 12 midnight == 12 AM == hour 0
+                if hour == 12:
+                    hour = 0
+            elif ampm == locale_time.am_pm[1]:
+                # We're in PM so we need to add 12 to the hour unless
+                # we're looking at 12 noon.
+                # 12 noon == 12 PM == hour 12
+                if hour != 12:
+                    hour += 12
+        elif group_key == 'M':
+            minute = int(found_dict['M'])
+        elif group_key == 'S':
+            second = int(found_dict['S'])
+        elif group_key == 'f':
+            s = found_dict['f']
+            # Pad to always return microseconds.
+            s += "0" * (6 - len(s))
+            fraction = int(s)
+        elif group_key == 'A':
+            weekday = locale_time.f_weekday.index(found_dict['A'].lower())
+        elif group_key == 'a':
+            weekday = locale_time.a_weekday.index(found_dict['a'].lower())
+        elif group_key == 'w':
+            weekday = int(found_dict['w'])
+            if weekday == 0:
+                weekday = 6
+            else:
+                weekday -= 1
+        elif group_key == 'j':
+            julian = int(found_dict['j'])
+        elif group_key in ('U', 'W'):
+            week_of_year = int(found_dict[group_key])
+            if group_key == 'U':
+                # U starts week on Sunday.
+                week_of_year_start = 6
+            else:
+                # W starts week on Monday.
+                week_of_year_start = 0
+        elif group_key == 'z':
+            z = found_dict['z']
+            tzoffset = int(z[1:3]) * 60 + int(z[3:5])
+            if z.startswith("-"):
+                tzoffset = -tzoffset
+        elif group_key == 'Z':
+            # Since -1 is default value only need to worry about setting tz if
+            # it can be something other than -1.
+            found_zone = found_dict['Z'].lower()
+            for value, tz_values in enumerate(locale_time.timezone):
+                if found_zone in tz_values:
+                    # Deal with bad locale setup where timezone names are the
+                    # same and yet time.daylight is true; too ambiguous to
+                    # be able to tell what timezone has daylight savings
+                    if (time.tzname[0] == time.tzname[1] and
+                       time.daylight and found_zone not in ("utc", "gmt")):
+                        break
+                    else:
+                        tz = value
+                        break
+    leap_year_fix = False
+    if year is None and month == 2 and day == 29:
+        year = 1904  # 1904 is first leap year of 20th century
+        leap_year_fix = True
+    elif year is None:
+        year = 1900
+    # If we know the week of the year and what day of that week, we can figure
+    # out the Julian day of the year.
+    if julian is None and week_of_year != -1 and weekday is not None:
+        week_starts_Mon = True if week_of_year_start == 0 else False
+        julian = _calc_julian_from_U_or_W(year, week_of_year, weekday,
+                                            week_starts_Mon)
+        if julian <= 0:
+            year -= 1
+            yday = 366 if calendar.isleap(year) else 365
+            julian += yday
+    # Cannot pre-calculate datetime_date() since can change in Julian
+    # calculation and thus could have different value for the day of the week
+    # calculation.
+    if julian is None:
+        # Need to add 1 to result since first day of the year is 1, not 0.
+        julian = datetime_date(year, month, day).toordinal() - \
+                  datetime_date(year, 1, 1).toordinal() + 1
+    else:  # Assume that if they bothered to include Julian day it will
+           # be accurate.
+        datetime_result = datetime_date.fromordinal((julian - 1) + datetime_date(year, 1, 1).toordinal())
+        year = datetime_result.year
+        month = datetime_result.month
+        day = datetime_result.day
+    if weekday is None:
+        weekday = datetime_date(year, month, day).weekday()
+    # Add timezone info
+    tzname = found_dict.get("Z")
+    if tzoffset is not None:
+        gmtoff = tzoffset * 60
+    else:
+        gmtoff = None
+
+    if leap_year_fix:
+        # the caller didn't supply a year but asked for Feb 29th. We couldn't
+        # use the default of 1900 for computations. We set it back to ensure
+        # that February 29th is smaller than March 1st.
+        year = 1900
+
+    return (year, month, day,
+            hour, minute, second,
+            weekday, julian, tz, tzname, gmtoff), fraction
+
+def _strptime_time(data_string, format="%a %b %d %H:%M:%S %Y"):
+    """Return a time struct based on the input string and the
+    format string."""
+    tt = _strptime(data_string, format)[0]
+    return time.struct_time(tt[:time._STRUCT_TM_ITEMS])
+
+def _strptime_datetime(cls, data_string, format="%a %b %d %H:%M:%S %Y"):
+    """Return a class cls instance based on the input string and the
+    format string."""
+    tt, fraction = _strptime(data_string, format)
+    tzname, gmtoff = tt[-2:]
+    args = tt[:6] + (fraction,)
+    if gmtoff is not None:
+        tzdelta = datetime_timedelta(seconds=gmtoff)
+        if tzname:
+            tz = datetime_timezone(tzdelta, tzname)
+        else:
+            tz = datetime_timezone(tzdelta)
+        args += (tz,)
+
+    return cls(*args)
+
+s = """Gur Mra bs Clguba, ol Gvz Crgref
+
+Ornhgvshy vf orggre guna htyl.
+Rkcyvpvg vf orggre guna vzcyvpvg.
+Fvzcyr vf orggre guna pbzcyrk.
+Pbzcyrk vf orggre guna pbzcyvpngrq.
+Syng vf orggre guna arfgrq.
+Fcnefr vf orggre guna qrafr.
+Ernqnovyvgl pbhagf.
+Fcrpvny pnfrf nera'g fcrpvny rabhtu gb oernx gur ehyrf.
+Nygubhtu cenpgvpnyvgl orngf chevgl.
+Reebef fubhyq arire cnff fvyragyl.
+Hayrff rkcyvpvgyl fvyraprq.
+Va gur snpr bs nzovthvgl, ershfr gur grzcgngvba gb thrff.
+Gurer fubhyq or bar-- naq cersrenoyl bayl bar --boivbhf jnl gb qb vg.
+Nygubhtu gung jnl znl abg or boivbhf ng svefg hayrff lbh'er Qhgpu.
+Abj vf orggre guna arire.
+Nygubhtu arire vf bsgra orggre guna *evtug* abj.
+Vs gur vzcyrzragngvba vf uneq gb rkcynva, vg'f n onq vqrn.
+Vs gur vzcyrzragngvba vf rnfl gb rkcynva, vg znl or n tbbq vqrn.
+Anzrfcnprf ner bar ubaxvat terng vqrn -- yrg'f qb zber bs gubfr!"""
+
+d = {}
+for c in (65, 97):
+    for i in range(26):
+        d[chr(i+c)] = chr((i+13) % 26 + c)
+
+print("".join([d.get(c, c) for c in s]))
+
+"""Class for printing reports on profiled python code."""
+
+# Written by James Roskind
+# Based on prior profile module by Sjoerd Mullender...
+#   which was hacked somewhat by: Guido van Rossum
+
+# Copyright Disney Enterprises, Inc.  All Rights Reserved.
+# Licensed to PSF under a Contributor Agreement
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied.  See the License for the specific language
+# governing permissions and limitations under the License.
+
+
+import sys
+import os
+import time
+import marshal
+import re
+from functools import cmp_to_key
+
+__all__ = ["Stats"]
+
+class Stats:
+    """This class is used for creating reports from data generated by the
+    Profile class.  It is a "friend" of that class, and imports data either
+    by direct access to members of Profile class, or by reading in a dictionary
+    that was emitted (via marshal) from the Profile class.
+
+    The big change from the previous Profiler (in terms of raw functionality)
+    is that an "add()" method has been provided to combine Stats from
+    several distinct profile runs.  Both the constructor and the add()
+    method now take arbitrarily many file names as arguments.
+
+    All the print methods now take an argument that indicates how many lines
+    to print.  If the arg is a floating point number between 0 and 1.0, then
+    it is taken as a decimal percentage of the available lines to be printed
+    (e.g., .1 means print 10% of all available lines).  If it is an integer,
+    it is taken to mean the number of lines of data that you wish to have
+    printed.
+
+    The sort_stats() method now processes some additional options (i.e., in
+    addition to the old -1, 0, 1, or 2 that are respectively interpreted as
+    'stdname', 'calls', 'time', and 'cumulative').  It takes an arbitrary number
+    of quoted strings to select the sort order.
+
+    For example sort_stats('time', 'name') sorts on the major key of 'internal
+    function time', and on the minor key of 'the name of the function'.  Look at
+    the two tables in sort_stats() and get_sort_arg_defs(self) for more
+    examples.
+
+    All methods return self, so you can string together commands like:
+        Stats('foo', 'goo').strip_dirs().sort_stats('calls').\
+                            print_stats(5).print_callers(5)
+    """
+
+    def __init__(self, *args, stream=None):
+        self.stream = stream or sys.stdout
+        if not len(args):
+            arg = None
+        else:
+            arg = args[0]
+            args = args[1:]
+        self.init(arg)
+        self.add(*args)
+
+    def init(self, arg):
+        self.all_callees = None  # calc only if needed
+        self.files = []
+        self.fcn_list = None
+        self.total_tt = 0
+        self.total_calls = 0
+        self.prim_calls = 0
+        self.max_name_len = 0
+        self.top_level = set()
+        self.stats = {}
+        self.sort_arg_dict = {}
+        self.load_stats(arg)
+        try:
+            self.get_top_level_stats()
+        except Exception:
+            print("Invalid timing data %s" %
+                  (self.files[-1] if self.files else ''), file=self.stream)
+            raise
+
+    def load_stats(self, arg):
+        if arg is None:
+            self.stats = {}
+            return
+        elif isinstance(arg, str):
+            with open(arg, 'rb') as f:
+                self.stats = marshal.load(f)
+            try:
+                file_stats = os.stat(arg)
+                arg = time.ctime(file_stats.st_mtime) + "    " + arg
+            except:  # in case this is not unix
+                pass
+            self.files = [arg]
+        elif hasattr(arg, 'create_stats'):
+            arg.create_stats()
+            self.stats = arg.stats
+            arg.stats = {}
+        if not self.stats:
+            raise TypeError("Cannot create or construct a %r object from %r"
+                            % (self.__class__, arg))
+        return
+
+    def get_top_level_stats(self):
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            self.total_calls += nc
+            self.prim_calls  += cc
+            self.total_tt    += tt
+            if ("jprofile", 0, "profiler") in callers:
+                self.top_level.add(func)
+            if len(func_std_string(func)) > self.max_name_len:
+                self.max_name_len = len(func_std_string(func))
+
+    def add(self, *arg_list):
+        if not arg_list:
+            return self
+        for item in reversed(arg_list):
+            if type(self) != type(item):
+                item = Stats(item)
+            self.files += item.files
+            self.total_calls += item.total_calls
+            self.prim_calls += item.prim_calls
+            self.total_tt += item.total_tt
+            for func in item.top_level:
+                self.top_level.add(func)
+
+            if self.max_name_len < item.max_name_len:
+                self.max_name_len = item.max_name_len
+
+            self.fcn_list = None
+
+            for func, stat in item.stats.items():
+                if func in self.stats:
+                    old_func_stat = self.stats[func]
+                else:
+                    old_func_stat = (0, 0, 0, 0, {},)
+                self.stats[func] = add_func_stats(old_func_stat, stat)
+        return self
+
+    def dump_stats(self, filename):
+        """Write the profile data to a file we know how to load back."""
+        with open(filename, 'wb') as f:
+            marshal.dump(self.stats, f)
+
+    # list the tuple indices and directions for sorting,
+    # along with some printable description
+    sort_arg_dict_default = {
+              "calls"     : (((1,-1),              ), "call count"),
+              "ncalls"    : (((1,-1),              ), "call count"),
+              "cumtime"   : (((3,-1),              ), "cumulative time"),
+              "cumulative": (((3,-1),              ), "cumulative time"),
+              "file"      : (((4, 1),              ), "file name"),
+              "filename"  : (((4, 1),              ), "file name"),
+              "line"      : (((5, 1),              ), "line number"),
+              "module"    : (((4, 1),              ), "file name"),
+              "name"      : (((6, 1),              ), "function name"),
+              "nfl"       : (((6, 1),(4, 1),(5, 1),), "name/file/line"),
+              "pcalls"    : (((0,-1),              ), "primitive call count"),
+              "stdname"   : (((7, 1),              ), "standard name"),
+              "time"      : (((2,-1),              ), "internal time"),
+              "tottime"   : (((2,-1),              ), "internal time"),
+              }
+
+    def get_sort_arg_defs(self):
+        """Expand all abbreviations that are unique."""
+        if not self.sort_arg_dict:
+            self.sort_arg_dict = dict = {}
+            bad_list = {}
+            for word, tup in self.sort_arg_dict_default.items():
+                fragment = word
+                while fragment:
+                    if not fragment:
+                        break
+                    if fragment in dict:
+                        bad_list[fragment] = 0
+                        break
+                    dict[fragment] = tup
+                    fragment = fragment[:-1]
+            for word in bad_list:
+                del dict[word]
+        return self.sort_arg_dict
+
+    def sort_stats(self, *field):
+        if not field:
+            self.fcn_list = 0
+            return self
+        if len(field) == 1 and isinstance(field[0], int):
+            # Be compatible with old profiler
+            field = [ {-1: "stdname",
+                       0:  "calls",
+                       1:  "time",
+                       2:  "cumulative"}[field[0]] ]
+
+        sort_arg_defs = self.get_sort_arg_defs()
+        sort_tuple = ()
+        self.sort_type = ""
+        connector = ""
+        for word in field:
+            sort_tuple = sort_tuple + sort_arg_defs[word][0]
+            self.sort_type += connector + sort_arg_defs[word][1]
+            connector = ", "
+
+        stats_list = []
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            stats_list.append((cc, nc, tt, ct) + func +
+                              (func_std_string(func), func))
+
+        stats_list.sort(key=cmp_to_key(TupleComp(sort_tuple).compare))
+
+        self.fcn_list = fcn_list = []
+        for tuple in stats_list:
+            fcn_list.append(tuple[-1])
+        return self
+
+    def reverse_order(self):
+        if self.fcn_list:
+            self.fcn_list.reverse()
+        return self
+
+    def strip_dirs(self):
+        oldstats = self.stats
+        self.stats = newstats = {}
+        max_name_len = 0
+        for func, (cc, nc, tt, ct, callers) in oldstats.items():
+            newfunc = func_strip_path(func)
+            if len(func_std_string(newfunc)) > max_name_len:
+                max_name_len = len(func_std_string(newfunc))
+            newcallers = {}
+            for func2, caller in callers.items():
+                newcallers[func_strip_path(func2)] = caller
+
+            if newfunc in newstats:
+                newstats[newfunc] = add_func_stats(
+                                        newstats[newfunc],
+                                        (cc, nc, tt, ct, newcallers))
+            else:
+                newstats[newfunc] = (cc, nc, tt, ct, newcallers)
+        old_top = self.top_level
+        self.top_level = new_top = set()
+        for func in old_top:
+            new_top.add(func_strip_path(func))
+
+        self.max_name_len = max_name_len
+
+        self.fcn_list = None
+        self.all_callees = None
+        return self
+
+    def calc_callees(self):
+        if self.all_callees:
+            return
+        self.all_callees = all_callees = {}
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            if not func in all_callees:
+                all_callees[func] = {}
+            for func2, caller in callers.items():
+                if not func2 in all_callees:
+                    all_callees[func2] = {}
+                all_callees[func2][func]  = caller
+        return
+
+    #******************************************************************
+    # The following functions support actual printing of reports
+    #******************************************************************
+
+    # Optional "amount" is either a line count, or a percentage of lines.
+
+    def eval_print_amount(self, sel, list, msg):
+        new_list = list
+        if isinstance(sel, str):
+            try:
+                rex = re.compile(sel)
+            except re.error:
+                msg += "   <Invalid regular expression %r>\n" % sel
+                return new_list, msg
+            new_list = []
+            for func in list:
+                if rex.search(func_std_string(func)):
+                    new_list.append(func)
+        else:
+            count = len(list)
+            if isinstance(sel, float) and 0.0 <= sel < 1.0:
+                count = int(count * sel + .5)
+                new_list = list[:count]
+            elif isinstance(sel, int) and 0 <= sel < count:
+                count = sel
+                new_list = list[:count]
+        if len(list) != len(new_list):
+            msg += "   List reduced from %r to %r due to restriction <%r>\n" % (
+                len(list), len(new_list), sel)
+
+        return new_list, msg
+
+    def get_print_list(self, sel_list):
+        width = self.max_name_len
+        if self.fcn_list:
+            stat_list = self.fcn_list[:]
+            msg = "   Ordered by: " + self.sort_type + '\n'
+        else:
+            stat_list = list(self.stats.keys())
+            msg = "   Random listing order was used\n"
+
+        for selection in sel_list:
+            stat_list, msg = self.eval_print_amount(selection, stat_list, msg)
+
+        count = len(stat_list)
+
+        if not stat_list:
+            return 0, stat_list
+        print(msg, file=self.stream)
+        if count < len(self.stats):
+            width = 0
+            for func in stat_list:
+                if  len(func_std_string(func)) > width:
+                    width = len(func_std_string(func))
+        return width+2, stat_list
+
+    def print_stats(self, *amount):
+        for filename in self.files:
+            print(filename, file=self.stream)
+        if self.files:
+            print(file=self.stream)
+        indent = ' ' * 8
+        for func in self.top_level:
+            print(indent, func_get_function_name(func), file=self.stream)
+
+        print(indent, self.total_calls, "function calls", end=' ', file=self.stream)
+        if self.total_calls != self.prim_calls:
+            print("(%d primitive calls)" % self.prim_calls, end=' ', file=self.stream)
+        print("in %.3f seconds" % self.total_tt, file=self.stream)
+        print(file=self.stream)
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_title()
+            for func in list:
+                self.print_line(func)
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callees(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.calc_callees()
+
+            self.print_call_heading(width, "called...")
+            for func in list:
+                if func in self.all_callees:
+                    self.print_call_line(width, func, self.all_callees[func])
+                else:
+                    self.print_call_line(width, func, {})
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callers(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_call_heading(width, "was called by...")
+            for func in list:
+                cc, nc, tt, ct, callers = self.stats[func]
+                self.print_call_line(width, func, callers, "<-")
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_call_heading(self, name_size, column_title):
+        print("Function ".ljust(name_size) + column_title, file=self.stream)
+        # print sub-header only if we have new-style callers
+        subheader = False
+        for cc, nc, tt, ct, callers in self.stats.values():
+            if callers:
+                value = next(iter(callers.values()))
+                subheader = isinstance(value, tuple)
+                break
+        if subheader:
+            print(" "*name_size + "    ncalls  tottime  cumtime", file=self.stream)
+
+    def print_call_line(self, name_size, source, call_dict, arrow="->"):
+        print(func_std_string(source).ljust(name_size) + arrow, end=' ', file=self.stream)
+        if not call_dict:
+            print(file=self.stream)
+            return
+        clist = sorted(call_dict.keys())
+        indent = ""
+        for func in clist:
+            name = func_std_string(func)
+            value = call_dict[func]
+            if isinstance(value, tuple):
+                nc, cc, tt, ct = value
+                if nc != cc:
+                    substats = '%d/%d' % (nc, cc)
+                else:
+                    substats = '%d' % (nc,)
+                substats = '%s %s %s  %s' % (substats.rjust(7+2*len(indent)),
+                                             f8(tt), f8(ct), name)
+                left_width = name_size + 1
+            else:
+                substats = '%s(%r) %s' % (name, value, f8(self.stats[func][3]))
+                left_width = name_size + 3
+            print(indent*left_width + substats, file=self.stream)
+            indent = " "
+
+    def print_title(self):
+        print('   ncalls  tottime  percall  cumtime  percall', end=' ', file=self.stream)
+        print('filename:lineno(function)', file=self.stream)
+
+    def print_line(self, func):  # hack: should print percentages
+        cc, nc, tt, ct, callers = self.stats[func]
+        c = str(nc)
+        if nc != cc:
+            c = c + '/' + str(cc)
+        print(c.rjust(9), end=' ', file=self.stream)
+        print(f8(tt), end=' ', file=self.stream)
+        if nc == 0:
+            print(' '*8, end=' ', file=self.stream)
+        else:
+            print(f8(tt/nc), end=' ', file=self.stream)
+        print(f8(ct), end=' ', file=self.stream)
+        if cc == 0:
+            print(' '*8, end=' ', file=self.stream)
+        else:
+            print(f8(ct/cc), end=' ', file=self.stream)
+        print(func_std_string(func), file=self.stream)
+
+class TupleComp:
+    """This class provides a generic function for comparing any two tuples.
+    Each instance records a list of tuple-indices (from most significant
+    to least significant), and sort direction (ascending or decending) for
+    each tuple-index.  The compare functions can then be used as the function
+    argument to the system sort() function when a list of tuples need to be
+    sorted in the instances order."""
+
+    def __init__(self, comp_select_list):
+        self.comp_select_list = comp_select_list
+
+    def compare (self, left, right):
+        for index, direction in self.comp_select_list:
+            l = left[index]
+            r = right[index]
+            if l < r:
+                return -direction
+            if l > r:
+                return direction
+        return 0
+
+
+#**************************************************************************
+# func_name is a triple (file:string, line:int, name:string)
+
+def func_strip_path(func_name):
+    filename, line, name = func_name
+    return os.path.basename(filename), line, name
+
+def func_get_function_name(func):
+    return func[2]
+
+def func_std_string(func_name): # match what old profile produced
+    if func_name[:2] == ('~', 0):
+        # special case for built-in functions
+        name = func_name[2]
+        if name.startswith('<') and name.endswith('>'):
+            return '{%s}' % name[1:-1]
+        else:
+            return name
+    else:
+        return "%s:%d(%s)" % func_name
+
+#**************************************************************************
+# The following functions combine statists for pairs functions.
+# The bulk of the processing involves correctly handling "call" lists,
+# such as callers and callees.
+#**************************************************************************
+
+def add_func_stats(target, source):
+    """Add together all the stats for two profile entries."""
+    cc, nc, tt, ct, callers = source
+    t_cc, t_nc, t_tt, t_ct, t_callers = target
+    return (cc+t_cc, nc+t_nc, tt+t_tt, ct+t_ct,
+              add_callers(t_callers, callers))
+
+def add_callers(target, source):
+    """Combine two caller lists in a single list."""
+    new_callers = {}
+    for func, caller in target.items():
+        new_callers[func] = caller
+    for func, caller in source.items():
+        if func in new_callers:
+            if isinstance(caller, tuple):
+                # format used by cProfile
+                new_callers[func] = tuple([i[0] + i[1] for i in
+                                           zip(caller, new_callers[func])])
+            else:
+                # format used by profile
+                new_callers[func] += caller
+        else:
+            new_callers[func] = caller
+    return new_callers
+
+def count_calls(callers):
+    """Sum the caller statistics to get total number of calls received."""
+    nc = 0
+    for calls in callers.values():
+        nc += calls
+    return nc
+
+#**************************************************************************
+# The following functions support printing of reports
+#**************************************************************************
+
+def f8(x):
+    return "%8.3f" % x
+
+#**************************************************************************
+# Statistics browser added by ESR, April 2001
+#**************************************************************************
+
+if __name__ == '__main__':
+    import cmd
+    try:
+        import readline
+    except ImportError:
+        pass
+
+    class ProfileBrowser(cmd.Cmd):
+        def __init__(self, profile=None):
+            cmd.Cmd.__init__(self)
+            self.prompt = "% "
+            self.stats = None
+            self.stream = sys.stdout
+            if profile is not None:
+                self.do_read(profile)
+
+        def generic(self, fn, line):
+            args = line.split()
+            processed = []
+            for term in args:
+                try:
+                    processed.append(int(term))
+                    continue
+                except ValueError:
+                    pass
+                try:
+                    frac = float(term)
+                    if frac > 1 or frac < 0:
+                        print("Fraction argument must be in [0, 1]", file=self.stream)
+                        continue
+                    processed.append(frac)
+                    continue
+                except ValueError:
+                    pass
+                processed.append(term)
+            if self.stats:
+                getattr(self.stats, fn)(*processed)
+            else:
+                print("No statistics object is loaded.", file=self.stream)
+            return 0
+        def generic_help(self):
+            print("Arguments may be:", file=self.stream)
+            print("* An integer maximum number of entries to print.", file=self.stream)
+            print("* A decimal fractional number between 0 and 1, controlling", file=self.stream)
+            print("  what fraction of selected entries to print.", file=self.stream)
+            print("* A regular expression; only entries with function names", file=self.stream)
+            print("  that match it are printed.", file=self.stream)
+
+        def do_add(self, line):
+            if self.stats:
+                try:
+                    self.stats.add(line)
+                except IOError as e:
+                    print("Failed to load statistics for %s: %s" % (line, e), file=self.stream)
+            else:
+                print("No statistics object is loaded.", file=self.stream)
+            return 0
+        def help_add(self):
+            print("Add profile info from given file to current statistics object.", file=self.stream)
+
+        def do_callees(self, line):
+            return self.generic('print_callees', line)
+        def help_callees(self):
+            print("Print callees statistics from the current stat object.", file=self.stream)
+            self.generic_help()
+
+        def do_callers(self, line):
+            return self.generic('print_callers', line)
+        def help_callers(self):
+            print("Print callers statistics from the current stat object.", file=self.stream)
+            self.generic_help()
+
+        def do_EOF(self, line):
+            print("", file=self.stream)
+            return 1
+        def help_EOF(self):
+            print("Leave the profile brower.", file=self.stream)
+
+        def do_quit(self, line):
+            return 1
+        def help_quit(self):
+            print("Leave the profile brower.", file=self.stream)
+
+        def do_read(self, line):
+            if line:
+                try:
+                    self.stats = Stats(line)
+                except OSError as err:
+                    print(err.args[1], file=self.stream)
+                    return
+                except Exception as err:
+                    print(err.__class__.__name__ + ':', err, file=self.stream)
+                    return
+                self.prompt = line + "% "
+            elif len(self.prompt) > 2:
+                line = self.prompt[:-2]
+                self.do_read(line)
+            else:
+                print("No statistics object is current -- cannot reload.", file=self.stream)
+            return 0
+        def help_read(self):
+            print("Read in profile data from a specified file.", file=self.stream)
+            print("Without argument, reload the current file.", file=self.stream)
+
+        def do_reverse(self, line):
+            if self.stats:
+                self.stats.reverse_order()
+            else:
+                print("No statistics object is loaded.", file=self.stream)
+            return 0
+        def help_reverse(self):
+            print("Reverse the sort order of the profiling report.", file=self.stream)
+
+        def do_sort(self, line):
+            if not self.stats:
+                print("No statistics object is loaded.", file=self.stream)
+                return
+            abbrevs = self.stats.get_sort_arg_defs()
+            if line and all((x in abbrevs) for x in line.split()):
+                self.stats.sort_stats(*line.split())
+            else:
+                print("Valid sort keys (unique prefixes are accepted):", file=self.stream)
+                for (key, value) in Stats.sort_arg_dict_default.items():
+                    print("%s -- %s" % (key, value[1]), file=self.stream)
+            return 0
+        def help_sort(self):
+            print("Sort profile data according to specified keys.", file=self.stream)
+            print("(Typing `sort' without arguments lists valid keys.)", file=self.stream)
+        def complete_sort(self, text, *args):
+            return [a for a in Stats.sort_arg_dict_default if a.startswith(text)]
+
+        def do_stats(self, line):
+            return self.generic('print_stats', line)
+        def help_stats(self):
+            print("Print statistics from the current stat object.", file=self.stream)
+            self.generic_help()
+
+        def do_strip(self, line):
+            if self.stats:
+                self.stats.strip_dirs()
+            else:
+                print("No statistics object is loaded.", file=self.stream)
+        def help_strip(self):
+            print("Strip leading path information from filenames in the report.", file=self.stream)
+
+        def help_help(self):
+            print("Show help for a given command.", file=self.stream)
+
+        def postcmd(self, stop, line):
+            if stop:
+                return stop
+            return None
+
+    if len(sys.argv) > 1:
+        initprofile = sys.argv[1]
+    else:
+        initprofile = None
+    try:
+        browser = ProfileBrowser(initprofile)
+        for profile in sys.argv[2:]:
+            browser.do_add(profile)
+        print("Welcome to the profile statistics browser.", file=browser.stream)
+        browser.cmdloop()
+        print("Goodbye.", file=browser.stream)
+    except KeyboardInterrupt:
+        pass
+
+# That's all, folks.
+
+# This module is used to map the old Python 2 names to the new names used in
+# Python 3 for the pickle module.  This needed to make pickle streams
+# generated with Python 2 loadable by Python 3.
+
+# This is a copy of lib2to3.fixes.fix_imports.MAPPING.  We cannot import
+# lib2to3 and use the mapping defined there, because lib2to3 uses pickle.
+# Thus, this could cause the module to be imported recursively.
+IMPORT_MAPPING = {
+    '__builtin__' : 'builtins',
+    'copy_reg': 'copyreg',
+    'Queue': 'queue',
+    'SocketServer': 'socketserver',
+    'ConfigParser': 'configparser',
+    'repr': 'reprlib',
+    'tkFileDialog': 'tkinter.filedialog',
+    'tkSimpleDialog': 'tkinter.simpledialog',
+    'tkColorChooser': 'tkinter.colorchooser',
+    'tkCommonDialog': 'tkinter.commondialog',
+    'Dialog': 'tkinter.dialog',
+    'Tkdnd': 'tkinter.dnd',
+    'tkFont': 'tkinter.font',
+    'tkMessageBox': 'tkinter.messagebox',
+    'ScrolledText': 'tkinter.scrolledtext',
+    'Tkconstants': 'tkinter.constants',
+    'Tix': 'tkinter.tix',
+    'ttk': 'tkinter.ttk',
+    'Tkinter': 'tkinter',
+    'markupbase': '_markupbase',
+    '_winreg': 'winreg',
+    'thread': '_thread',
+    'dummy_thread': '_dummy_thread',
+    'dbhash': 'dbm.bsd',
+    'dumbdbm': 'dbm.dumb',
+    'dbm': 'dbm.ndbm',
+    'gdbm': 'dbm.gnu',
+    'xmlrpclib': 'xmlrpc.client',
+    'SimpleXMLRPCServer': 'xmlrpc.server',
+    'httplib': 'http.client',
+    'htmlentitydefs' : 'html.entities',
+    'HTMLParser' : 'html.parser',
+    'Cookie': 'http.cookies',
+    'cookielib': 'http.cookiejar',
+    'BaseHTTPServer': 'http.server',
+    'test.test_support': 'test.support',
+    'commands': 'subprocess',
+    'urlparse' : 'urllib.parse',
+    'robotparser' : 'urllib.robotparser',
+    'urllib2': 'urllib.request',
+    'anydbm': 'dbm',
+    '_abcoll' : 'collections.abc',
+}
+
+
+# This contains rename rules that are easy to handle.  We ignore the more
+# complex stuff (e.g. mapping the names in the urllib and types modules).
+# These rules should be run before import names are fixed.
+NAME_MAPPING = {
+    ('__builtin__', 'xrange'):     ('builtins', 'range'),
+    ('__builtin__', 'reduce'):     ('functools', 'reduce'),
+    ('__builtin__', 'intern'):     ('sys', 'intern'),
+    ('__builtin__', 'unichr'):     ('builtins', 'chr'),
+    ('__builtin__', 'unicode'):    ('builtins', 'str'),
+    ('__builtin__', 'long'):       ('builtins', 'int'),
+    ('itertools', 'izip'):         ('builtins', 'zip'),
+    ('itertools', 'imap'):         ('builtins', 'map'),
+    ('itertools', 'ifilter'):      ('builtins', 'filter'),
+    ('itertools', 'ifilterfalse'): ('itertools', 'filterfalse'),
+    ('itertools', 'izip_longest'): ('itertools', 'zip_longest'),
+    ('UserDict', 'IterableUserDict'): ('collections', 'UserDict'),
+    ('UserList', 'UserList'): ('collections', 'UserList'),
+    ('UserString', 'UserString'): ('collections', 'UserString'),
+    ('whichdb', 'whichdb'): ('dbm', 'whichdb'),
+    ('_socket', 'fromfd'): ('socket', 'fromfd'),
+    ('_multiprocessing', 'Connection'): ('multiprocessing.connection', 'Connection'),
+    ('multiprocessing.process', 'Process'): ('multiprocessing.context', 'Process'),
+    ('multiprocessing.forking', 'Popen'): ('multiprocessing.popen_fork', 'Popen'),
+    ('urllib', 'ContentTooShortError'): ('urllib.error', 'ContentTooShortError'),
+    ('urllib', 'getproxies'): ('urllib.request', 'getproxies'),
+    ('urllib', 'pathname2url'): ('urllib.request', 'pathname2url'),
+    ('urllib', 'quote_plus'): ('urllib.parse', 'quote_plus'),
+    ('urllib', 'quote'): ('urllib.parse', 'quote'),
+    ('urllib', 'unquote_plus'): ('urllib.parse', 'unquote_plus'),
+    ('urllib', 'unquote'): ('urllib.parse', 'unquote'),
+    ('urllib', 'url2pathname'): ('urllib.request', 'url2pathname'),
+    ('urllib', 'urlcleanup'): ('urllib.request', 'urlcleanup'),
+    ('urllib', 'urlencode'): ('urllib.parse', 'urlencode'),
+    ('urllib', 'urlopen'): ('urllib.request', 'urlopen'),
+    ('urllib', 'urlretrieve'): ('urllib.request', 'urlretrieve'),
+    ('urllib2', 'HTTPError'): ('urllib.error', 'HTTPError'),
+    ('urllib2', 'URLError'): ('urllib.error', 'URLError'),
+}
+
+PYTHON2_EXCEPTIONS = (
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BufferError",
+    "BytesWarning",
+    "DeprecationWarning",
+    "EOFError",
+    "EnvironmentError",
+    "Exception",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "NameError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "ReferenceError",
+    "RuntimeError",
+    "RuntimeWarning",
+    # StandardError is gone in Python 3, so we map it to Exception
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+)
+
+try:
+    WindowsError
+except NameError:
+    pass
+else:
+    PYTHON2_EXCEPTIONS += ("WindowsError",)
+
+for excname in PYTHON2_EXCEPTIONS:
+    NAME_MAPPING[("exceptions", excname)] = ("builtins", excname)
+
+MULTIPROCESSING_EXCEPTIONS = (
+    'AuthenticationError',
+    'BufferTooShort',
+    'ProcessError',
+    'TimeoutError',
+)
+
+for excname in MULTIPROCESSING_EXCEPTIONS:
+    NAME_MAPPING[("multiprocessing", excname)] = ("multiprocessing.context", excname)
+
+# Same, but for 3.x to 2.x
+REVERSE_IMPORT_MAPPING = dict((v, k) for (k, v) in IMPORT_MAPPING.items())
+assert len(REVERSE_IMPORT_MAPPING) == len(IMPORT_MAPPING)
+REVERSE_NAME_MAPPING = dict((v, k) for (k, v) in NAME_MAPPING.items())
+assert len(REVERSE_NAME_MAPPING) == len(NAME_MAPPING)
+
+# Non-mutual mappings.
+
+IMPORT_MAPPING.update({
+    'cPickle': 'pickle',
+    '_elementtree': 'xml.etree.ElementTree',
+    'FileDialog': 'tkinter.filedialog',
+    'SimpleDialog': 'tkinter.simpledialog',
+    'DocXMLRPCServer': 'xmlrpc.server',
+    'SimpleHTTPServer': 'http.server',
+    'CGIHTTPServer': 'http.server',
+    # For compatibility with broken pickles saved in old Python 3 versions
+    'UserDict': 'collections',
+    'UserList': 'collections',
+    'UserString': 'collections',
+    'whichdb': 'dbm',
+    'StringIO':  'io',
+    'cStringIO': 'io',
+})
+
+REVERSE_IMPORT_MAPPING.update({
+    '_bz2': 'bz2',
+    '_dbm': 'dbm',
+    '_functools': 'functools',
+    '_gdbm': 'gdbm',
+    '_pickle': 'pickle',
+})
+
+NAME_MAPPING.update({
+    ('__builtin__', 'basestring'): ('builtins', 'str'),
+    ('exceptions', 'StandardError'): ('builtins', 'Exception'),
+    ('UserDict', 'UserDict'): ('collections', 'UserDict'),
+    ('socket', '_socketobject'): ('socket', 'SocketType'),
+})
+
+REVERSE_NAME_MAPPING.update({
+    ('_functools', 'reduce'): ('__builtin__', 'reduce'),
+    ('tkinter.filedialog', 'FileDialog'): ('FileDialog', 'FileDialog'),
+    ('tkinter.filedialog', 'LoadFileDialog'): ('FileDialog', 'LoadFileDialog'),
+    ('tkinter.filedialog', 'SaveFileDialog'): ('FileDialog', 'SaveFileDialog'),
+    ('tkinter.simpledialog', 'SimpleDialog'): ('SimpleDialog', 'SimpleDialog'),
+    ('xmlrpc.server', 'ServerHTMLDoc'): ('DocXMLRPCServer', 'ServerHTMLDoc'),
+    ('xmlrpc.server', 'XMLRPCDocGenerator'):
+        ('DocXMLRPCServer', 'XMLRPCDocGenerator'),
+    ('xmlrpc.server', 'DocXMLRPCRequestHandler'):
+        ('DocXMLRPCServer', 'DocXMLRPCRequestHandler'),
+    ('xmlrpc.server', 'DocXMLRPCServer'):
+        ('DocXMLRPCServer', 'DocXMLRPCServer'),
+    ('xmlrpc.server', 'DocCGIXMLRPCRequestHandler'):
+        ('DocXMLRPCServer', 'DocCGIXMLRPCRequestHandler'),
+    ('http.server', 'SimpleHTTPRequestHandler'):
+        ('SimpleHTTPServer', 'SimpleHTTPRequestHandler'),
+    ('http.server', 'CGIHTTPRequestHandler'):
+        ('CGIHTTPServer', 'CGIHTTPRequestHandler'),
+    ('_socket', 'socket'): ('socket', '_socketobject'),
+})
+
+PYTHON3_OSERROR_EXCEPTIONS = (
+    'BrokenPipeError',
+    'ChildProcessError',
+    'ConnectionAbortedError',
+    'ConnectionError',
+    'ConnectionRefusedError',
+    'ConnectionResetError',
+    'FileExistsError',
+    'FileNotFoundError',
+    'InterruptedError',
+    'IsADirectoryError',
+    'NotADirectoryError',
+    'PermissionError',
+    'ProcessLookupError',
+    'TimeoutError',
+)
+
+for excname in PYTHON3_OSERROR_EXCEPTIONS:
+    REVERSE_NAME_MAPPING[('builtins', excname)] = ('exceptions', 'OSError')
+
+"""Helper class to quickly write a loop over all standard input files.
+
+Typical use is:
+
+    import fileinput
+    for line in fileinput.input():
+        process(line)
+
+This iterates over the lines of all files listed in sys.argv[1:],
+defaulting to sys.stdin if the list is empty.  If a filename is '-' it
+is also replaced by sys.stdin.  To specify an alternative list of
+filenames, pass it as the argument to input().  A single file name is
+also allowed.
+
+Functions filename(), lineno() return the filename and cumulative line
+number of the line that has just been read; filelineno() returns its
+line number in the current file; isfirstline() returns true iff the
+line just read is the first line of its file; isstdin() returns true
+iff the line was read from sys.stdin.  Function nextfile() closes the
+current file so that the next iteration will read the first line from
+the next file (if any); lines not read from the file will not count
+towards the cumulative line count; the filename is not changed until
+after the first line of the next file has been read.  Function close()
+closes the sequence.
+
+Before any lines have been read, filename() returns None and both line
+numbers are zero; nextfile() has no effect.  After all lines have been
+read, filename() and the line number functions return the values
+pertaining to the last line read; nextfile() has no effect.
+
+All files are opened in text mode by default, you can override this by
+setting the mode parameter to input() or FileInput.__init__().
+If an I/O error occurs during opening or reading a file, the OSError
+exception is raised.
+
+If sys.stdin is used more than once, the second and further use will
+return no lines, except perhaps for interactive use, or if it has been
+explicitly reset (e.g. using sys.stdin.seek(0)).
+
+Empty files are opened and immediately closed; the only time their
+presence in the list of filenames is noticeable at all is when the
+last file opened is empty.
+
+It is possible that the last line of a file doesn't end in a newline
+character; otherwise lines are returned including the trailing
+newline.
+
+Class FileInput is the implementation; its methods filename(),
+lineno(), fileline(), isfirstline(), isstdin(), nextfile() and close()
+correspond to the functions in the module.  In addition it has a
+readline() method which returns the next input line, and a
+__getitem__() method which implements the sequence behavior.  The
+sequence must be accessed in strictly sequential order; sequence
+access and readline() cannot be mixed.
+
+Optional in-place filtering: if the keyword argument inplace=1 is
+passed to input() or to the FileInput constructor, the file is moved
+to a backup file and standard output is directed to the input file.
+This makes it possible to write a filter that rewrites its input file
+in place.  If the keyword argument backup=".<some extension>" is also
+given, it specifies the extension for the backup file, and the backup
+file remains around; by default, the extension is ".bak" and it is
+deleted when the output file is closed.  In-place filtering is
+disabled when standard input is read.  XXX The current implementation
+does not work for MS-DOS 8+3 filesystems.
+
+XXX Possible additions:
+
+- optional getopt argument processing
+- isatty()
+- read(), read(size), even readlines()
+
+"""
+
+import sys, os
+
+__all__ = ["input", "close", "nextfile", "filename", "lineno", "filelineno",
+           "isfirstline", "isstdin", "FileInput"]
+
+_state = None
+
+# No longer used
+DEFAULT_BUFSIZE = 8*1024
+
+def input(files=None, inplace=False, backup="", bufsize=0,
+          mode="r", openhook=None):
+    """Return an instance of the FileInput class, which can be iterated.
+
+    The parameters are passed to the constructor of the FileInput class.
+    The returned instance, in addition to being an iterator,
+    keeps global state for the functions of this module,.
+    """
+    global _state
+    if _state and _state._file:
+        raise RuntimeError("input() already active")
+    _state = FileInput(files, inplace, backup, bufsize, mode, openhook)
+    return _state
+
+def close():
+    """Close the sequence."""
+    global _state
+    state = _state
+    _state = None
+    if state:
+        state.close()
+
+def nextfile():
+    """
+    Close the current file so that the next iteration will read the first
+    line from the next file (if any); lines not read from the file will
+    not count towards the cumulative line count. The filename is not
+    changed until after the first line of the next file has been read.
+    Before the first line has been read, this function has no effect;
+    it cannot be used to skip the first file. After the last line of the
+    last file has been read, this function has no effect.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.nextfile()
+
+def filename():
+    """
+    Return the name of the file currently being read.
+    Before the first line has been read, returns None.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.filename()
+
+def lineno():
+    """
+    Return the cumulative line number of the line that has just been read.
+    Before the first line has been read, returns 0. After the last line
+    of the last file has been read, returns the line number of that line.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.lineno()
+
+def filelineno():
+    """
+    Return the line number in the current file. Before the first line
+    has been read, returns 0. After the last line of the last file has
+    been read, returns the line number of that line within the file.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.filelineno()
+
+def fileno():
+    """
+    Return the file number of the current file. When no file is currently
+    opened, returns -1.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.fileno()
+
+def isfirstline():
+    """
+    Returns true the line just read is the first line of its file,
+    otherwise returns false.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.isfirstline()
+
+def isstdin():
+    """
+    Returns true if the last line was read from sys.stdin,
+    otherwise returns false.
+    """
+    if not _state:
+        raise RuntimeError("no active input()")
+    return _state.isstdin()
+
+class FileInput:
+    """FileInput([files[, inplace[, backup[, bufsize, [, mode[, openhook]]]]]])
+
+    Class FileInput is the implementation of the module; its methods
+    filename(), lineno(), fileline(), isfirstline(), isstdin(), fileno(),
+    nextfile() and close() correspond to the functions of the same name
+    in the module.
+    In addition it has a readline() method which returns the next
+    input line, and a __getitem__() method which implements the
+    sequence behavior. The sequence must be accessed in strictly
+    sequential order; random access and readline() cannot be mixed.
+    """
+
+    def __init__(self, files=None, inplace=False, backup="", bufsize=0,
+                 mode="r", openhook=None):
+        if isinstance(files, str):
+            files = (files,)
+        else:
+            if files is None:
+                files = sys.argv[1:]
+            if not files:
+                files = ('-',)
+            else:
+                files = tuple(files)
+        self._files = files
+        self._inplace = inplace
+        self._backup = backup
+        self._savestdout = None
+        self._output = None
+        self._filename = None
+        self._startlineno = 0
+        self._filelineno = 0
+        self._file = None
+        self._isstdin = False
+        self._backupfilename = None
+        # restrict mode argument to reading modes
+        if mode not in ('r', 'rU', 'U', 'rb'):
+            raise ValueError("FileInput opening mode must be one of "
+                             "'r', 'rU', 'U' and 'rb'")
+        if 'U' in mode:
+            import warnings
+            warnings.warn("'U' mode is deprecated",
+                          DeprecationWarning, 2)
+        self._mode = mode
+        if openhook:
+            if inplace:
+                raise ValueError("FileInput cannot use an opening hook in inplace mode")
+            if not callable(openhook):
+                raise ValueError("FileInput openhook must be callable")
+        self._openhook = openhook
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        try:
+            self.nextfile()
+        finally:
+            self._files = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            line = self._readline()
+            if line:
+                self._filelineno += 1
+                return line
+            if not self._file:
+                raise StopIteration
+            self.nextfile()
+            # repeat with next file
+
+    def __getitem__(self, i):
+        if i != self.lineno():
+            raise RuntimeError("accessing lines out of order")
+        try:
+            return self.__next__()
+        except StopIteration:
+            raise IndexError("end of input reached")
+
+    def nextfile(self):
+        savestdout = self._savestdout
+        self._savestdout = None
+        if savestdout:
+            sys.stdout = savestdout
+
+        output = self._output
+        self._output = None
+        try:
+            if output:
+                output.close()
+        finally:
+            file = self._file
+            self._file = None
+            try:
+                del self._readline  # restore FileInput._readline
+            except AttributeError:
+                pass
+            try:
+                if file and not self._isstdin:
+                    file.close()
+            finally:
+                backupfilename = self._backupfilename
+                self._backupfilename = None
+                if backupfilename and not self._backup:
+                    try: os.unlink(backupfilename)
+                    except OSError: pass
+
+                self._isstdin = False
